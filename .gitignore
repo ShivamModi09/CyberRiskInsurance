@@ -1,0 +1,23 @@
+# Python caching
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local environments / Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Project-specific caches and databases
+data/cache/
+*.json.tmp
+
+# IDEs and Editors
+.vscode/
+.idea/
+.DS_Store
+
+# Handover and local notes (optional, but CONTEXT_HANDOVER.md can be kept on Git if desired, 
+# but usually custom markdown reports for tools are ignored or committed. Keeping it commented out)
+# CONTEXT_HANDOVER.md
