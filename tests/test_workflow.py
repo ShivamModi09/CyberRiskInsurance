@@ -23,6 +23,8 @@ class TestWorkflowIntegration(unittest.TestCase):
             "valid": False,
             "enrichment": {},
             "mismatch_flag": False,
+            "entity_status": "Match",
+            "entity_resolution_confidence": "High",
             "cache_hit": False,
             "cache_data": None,
             "routing_tier": "Unknown / Tiny",
@@ -51,6 +53,8 @@ class TestWorkflowIntegration(unittest.TestCase):
             "valid": False,
             "enrichment": {},
             "mismatch_flag": False,
+            "entity_status": "Match",
+            "entity_resolution_confidence": "High",
             "cache_hit": False,
             "cache_data": None,
             "routing_tier": "Unknown / Tiny",
@@ -83,7 +87,10 @@ class TestWorkflowIntegration(unittest.TestCase):
         self.assertTrue(res_hit["valid"])
         self.assertTrue(res_hit["cache_hit"])
         self.assertIsNotNone(res_hit["cache_data"])
-        self.assertEqual(res_hit["cache_data"]["risk_category"], "Favourable")
+        # New cache strategy stores raw evidence, not final scores
+        self.assertEqual(res_hit["cache_data"]["cache_type"], "collector_cache")
+        # The final risk_category is still computed fresh by the underwriter
+        self.assertEqual(res_hit["risk_category"], "Favourable")
 
     def test_entity_mismatch(self):
         state = {
@@ -92,6 +99,8 @@ class TestWorkflowIntegration(unittest.TestCase):
             "valid": False,
             "enrichment": {},
             "mismatch_flag": False,
+            "entity_status": "Match",
+            "entity_resolution_confidence": "High",
             "cache_hit": False,
             "cache_data": None,
             "routing_tier": "Unknown / Tiny",

@@ -14,7 +14,8 @@ from src.collectors import (
     WikipediaCollector,
     DBCollector,
     SECCollector,
-    ResponsesAPICollector
+    ResponsesAPICollector,
+    WikidataCollector
 )
 
 def collectors_node(state: CyberRiskState) -> Dict[str, Any]:
@@ -24,7 +25,7 @@ def collectors_node(state: CyberRiskState) -> Dict[str, Any]:
     
     # Default to all core tools if router is bypassed/commented out
     if not budget:
-        budget = ["WebSearch", "DomainScraper", "Wikipedia", "DBCollector", "SECCollector", "ResponsesAPI"]
+        budget = ["WebSearch", "DomainScraper", "Wikipedia", "Wikidata", "DBCollector", "SECCollector", "ResponsesAPI"]
         
     logs = []
     
@@ -34,6 +35,7 @@ def collectors_node(state: CyberRiskState) -> Dict[str, Any]:
         "WebSearch": WebSearchCollector(),
         "DomainScraper": DomainScraperCollector(),
         "Wikipedia": WikipediaCollector(),
+        "Wikidata": WikidataCollector(),
         "DBCollector": DBCollector(),
         "SECCollector": SECCollector(),
         "ResponsesAPI": ResponsesAPICollector()
@@ -64,12 +66,13 @@ def collectors_node(state: CyberRiskState) -> Dict[str, Any]:
         "audit_logs": state.get("audit_logs", []) + logs
     }
 
-def supervisor_routing(state: CyberRiskState) -> Literal["collectors_node", "__end__"]:
-    """Determines whether to run collectors or exit early on invalid inputs or cache hits."""
+def supervisor_routing(state: CyberRiskState) -> Literal["collectors_node", "coordinator_node", "__end__"]:
+    """Determines next node after supervisor validation."""
     if not state.get("valid"):
         return "__end__"
     if state.get("cache_hit"):
-        return "__end__"
+        # Cache hit: skip collectors, restore raw evidence, re-evaluate through coordinator
+        return "coordinator_node"
     # Commented out router for now (future scope)
     # return "router_node"
     return "collectors_node"
@@ -96,6 +99,7 @@ def build_workflow():
         supervisor_routing,
         {
             "collectors_node": "collectors_node",
+            "coordinator_node": "coordinator_node",
             "__end__": END
         }
     )

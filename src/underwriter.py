@@ -64,18 +64,24 @@ def underwriter_node(state: CyberRiskState) -> Dict[str, Any]:
     logs.append(f"Underwriter: Aggregated Average Score = {avg_score:.2f} -> Risk Category: '{risk_category}'")
 
     # 4. Confidence Score & Band based on Fact Checker accuracy
-    confidence_score = float(round(accuracy * 100.0, 1))
-    if accuracy >= 0.8:
-        confidence_band = "High"
-    elif accuracy >= 0.5:
-        confidence_band = "Medium"
-    else:
+    # Zero out confidence if entity mismatch
+    if state.get("entity_status") == "Mismatch":
+        confidence_score = 0.0
         confidence_band = "Low"
-        
+        logs.append("Underwriter: Confidence zeroed out due to entity mismatch flag.")
+    else:
+        confidence_score = float(round(accuracy * 100.0, 1))
+        if accuracy >= 0.8:
+            confidence_band = "High"
+        elif accuracy >= 0.5:
+            confidence_band = "Medium"
+        else:
+            confidence_band = "Low"
+            
     logs.append(f"Underwriter: Fact-checking Accuracy = {accuracy:.2f} -> Confidence: {confidence_score}% ({confidence_band})")
 
     # 5. Human-in-the-Loop Escalation Logic
-    # Trigger if: accuracy < 50%, entity mismatch, or active contradictions
+    # Only trigger on actual contradictions ([X] Contradicted), not partial warnings
     human_escalation_flag = False
     reasons = []
     if accuracy < 0.5:
@@ -84,32 +90,31 @@ def underwriter_node(state: CyberRiskState) -> Dict[str, Any]:
     if mismatch:
         human_escalation_flag = True
         reasons.append("Supervisor flagged entity mismatch.")
-    if len(conflicts) > 0:
+
+    # Count only true contradictions (not partial variance warnings)
+    actual_contradictions = sum(
+        1 for flag in conflicts
+        if not flag.get("parameter", "").endswith("_partial")
+    )
+    if actual_contradictions > 0:
         human_escalation_flag = True
-        reasons.append(f"Active source contradictions detected: {len(conflicts)}")
+        reasons.append(f"Hard contradictions detected across sources: {actual_contradictions}")
         
     if human_escalation_flag:
         logs.append(f"Underwriter Escalation: Human routing triggered! Reasons: {reasons}")
     else:
         logs.append("Underwriter: Auto-approval path verified. No human escalation needed.")
 
-    # 6. Cache Write
-    profile_summary = {
-        "risk_category": risk_category,
-        "underwriting_rationale": underwriting_rationale,
-        "modifier_scores": modifier_scores,
-        "confidence_score": confidence_score,
-        "confidence_band": confidence_band,
-        "accuracy_score": accuracy,
-        "human_escalation_flag": human_escalation_flag,
-        "reconciled_profile": reconciled
-    }
-    
-    # Only write to cache if it wasn't a cache hit and the data is valid
+    # 6. Cache Write — NEW strategy: store raw collected_evidence (collector-side cache)
+    # This allows rules engine changes to be re-applied without re-scraping the web
     if state.get("valid") and not state.get("cache_hit"):
+        profile_summary = {
+            "collected_evidence": state.get("collected_evidence", {}),
+            "cache_type": "collector_cache"
+        }
         cache_mgr = CacheManager()
         cache_mgr.write(state.get("company_name"), state.get("domain"), profile_summary)
-        logs.append("Underwriter: Saved final evaluation profile and aliases to cache database.")
+        logs.append("Underwriter: Saved raw collector evidence to cache database.")
 
     return {
         "risk_category": risk_category,

@@ -1,4 +1,5 @@
 # Python caching
+.env
 __pycache__/
 *.py[cod]
 *$py.class
@@ -11,7 +12,9 @@ env/
 
 # Project-specific caches and databases
 data/cache/
+data/changes/
 *.json.tmp
+*.docx
 
 # IDEs and Editors
 .vscode/
