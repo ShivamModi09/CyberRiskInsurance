@@ -1,32 +1,61 @@
+import os
 import sys
+import asyncio
 import argparse
-from src.graph import build_workflow
+from src.registry import BusinessRuleRegistry
+from src.workflows import build_cyber_risk_rating_graph
+from src.cache import get_cache_manager
 
 def print_header(title: str):
     print("\n" + "=" * 60)
     print(f" {title.upper()} ".center(60, "="))
     print("=" * 60)
 
-def main():
-    parser = argparse.ArgumentParser(description="Cyber Risk Underwriting Predictor (LangGraph Local CLI)")
-    parser.add_argument("-n", "--name", required=True, help="Company name to evaluate")
-    parser.add_argument("-d", "--domain", required=True, help="Company primary domain (e.g. example.com)")
+async def main_async():
+    # Load all rules to trigger registration
+    import src.rules as _rules
+
+    parser = argparse.ArgumentParser(description="Shared Agent Framework CLI")
+    parser.add_argument("--list-rules", action="store_true", help="List all registered rules")
+    parser.add_argument("--rule", type=str, help="Rule ID to run (e.g. cyber_risk_rating)")
+    parser.add_argument("--company", type=str, help="Company name to evaluate")
+    parser.add_argument("--domain", type=str, help="Company domain (e.g. techgiant.com)")
     
     args = parser.parse_args()
-    company_name = args.name.strip()
+
+    if args.list_rules:
+        print_header("Registered Rules")
+        rules = BusinessRuleRegistry.list_rules()
+        for r in rules:
+            cfg = BusinessRuleRegistry.get(r)
+            print(f"- {cfg.rule_id}: {cfg.rule_name} ({cfg.description})")
+        sys.exit(0)
+
+    if not args.rule or not args.company or not args.domain:
+        parser.print_help()
+        sys.exit(1)
+
+    rule_id = args.rule.strip()
+    company_name = args.company.strip()
     domain = args.domain.strip()
 
+    if rule_id != "cyber_risk_rating":
+        print(f"[ERROR] Rule ID '{rule_id}' is not supported in the active configuration.")
+        sys.exit(1)
+
     print_header("Initializing Cyber Risk Predictor")
+    print(f"Rule Target:    {rule_id}")
     print(f"Company Target: {company_name}")
     print(f"Primary Domain: {domain}")
 
-    # Compile the graph
-    app = build_workflow()
+    # Compile the LangGraph workflow
+    app = build_cyber_risk_rating_graph(enable_cache=True)
 
     # Initial State
     initial_state = {
         "company_name": company_name,
         "domain": domain,
+        "rule_id": rule_id,
         "valid": False,
         "enrichment": {},
         "mismatch_flag": False,
@@ -36,6 +65,7 @@ def main():
         "cache_data": None,
         "routing_tier": "Unknown / Tiny",
         "tool_budget": [],
+        "reports": {},
         "collected_evidence": {},
         "reconciled_profile": {},
         "conflict_flags": [],
@@ -50,43 +80,35 @@ def main():
         "audit_logs": []
     }
 
-    # Run the graph
     try:
-        final_state = app.invoke(initial_state)
+        final_state = await app.ainvoke(initial_state)
     except Exception as e:
         print(f"\n[ERROR] Graph execution failed: {e}")
         sys.exit(1)
 
-    # 1. Check early validation reject
+    # 1. Validation check
     if not final_state.get("valid"):
         print_header("Validation Failed")
-        print("[REJECTED] The input company name or domain is invalid or blank.")
+        print("[REJECTED] The input company name or domain is invalid.")
         for log in final_state.get("audit_logs", []):
             print(f"  > {log}")
         sys.exit(0)
 
-    # 2. Print Audit logs
+    # 2. Print Trace & Audit Logs
     print_header("Execution Trace & Logs")
     for log in final_state.get("audit_logs", []):
         print(f"  > {log}")
 
-    # 3. Standard Run results
+    # 3. Print Results
     evidence = final_state.get("collected_evidence", {})
     real_sources = []
-    mock_sources_used = False
-    
     for tool_name, data in evidence.items():
         if data.get("status") == "success":
-            if data.get("is_mock", False):
-                mock_sources_used = True
-            else:
-                real_sources.append(tool_name)
-    
+            real_sources.append(tool_name)
+
     print_header("Collectors Run")
     print("Real Sources Used:")
     print(f"{', '.join(real_sources) if real_sources else 'None'}")
-    print("Mock Sources Used:")
-    print("Yes" if mock_sources_used else "No")
 
     reconciled = final_state.get("reconciled_profile", {})
     print_header("Reconciled Company Profile")
@@ -104,19 +126,32 @@ def main():
     print(f"{'Underwriting Claim':<30} | {'Status':<15} | {'Source Count':<12}")
     print("-" * 65)
     for claim, info in final_state.get("claims_verification", {}).items():
-        print(f"{claim:<30} | {info['status']:<15} | {info['sources_count']:<12}")
+        print(f"{claim:<30} | {info.get('status', 'Unsupported'):<15} | {info.get('sources_count', 0):<12}")
 
     print_header("Underwriter Modifier Evaluations")
-    for mod, details in final_state.get("modifier_scores", {}).items():
-        print(f"  * {mod}: {details.get('rating').upper()} (Score: {details.get('score')})")
-        print(f"    Rationale: {final_state.get('underwriting_rationale', {}).get(mod)}")
+    for idx, (mod, details) in enumerate(final_state.get("modifier_scores", {}).items(), 1):
+        print(f"  {idx}. {mod}: {details.get('rating').upper()} (Score: {details.get('score')})")
+        print(f"     Rationale: {final_state.get('underwriting_rationale', {}).get(mod)}")
 
     print_header("Final Underwriting Modifier Verdict")
     print(f"Entity Status:       {final_state.get('entity_status', 'Match')}")
-    print(f"Risk Category:       {final_state.get('risk_category').upper()}")
+    print(f"Risk Category:       {final_state.get('risk_category', 'Average').upper()}")
     print(f"Underwriting Score:  {final_state.get('confidence_score')}%")
     print(f"Confidence Band:     {final_state.get('confidence_band')}")
     print(f"Human Escalation:    {final_state.get('human_escalation_flag')}")
+
+    # Write Cache on success
+    if final_state.get("valid") and not final_state.get("cache_hit"):
+        cache_mgr = get_cache_manager()
+        profile_summary = {
+            "collected_evidence": final_state.get("collected_evidence", {}),
+            "cache_type": "collector_cache"
+        }
+        cache_mgr.write(company_name, domain, profile_summary)
+        print("\n> Saved raw collector evidence to cache database.")
+
+def main():
+    asyncio.run(main_async())
 
 if __name__ == "__main__":
     main()
