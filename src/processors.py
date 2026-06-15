@@ -74,7 +74,7 @@ class CollectionCoordinatorAgent(BaseCoordinatorAgent):
                 break
             val_count = get_val(src, "subsidiaries_count")
             if val_count is not None:
-                merged["subsidiaries"] = ["Company Placeholder"] * val_count
+                merged["subsidiaries"] = ["Exhibit 21 Subsidiary"] * val_count
                 break
 
         # Acquisitions Priority
