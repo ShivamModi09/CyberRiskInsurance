@@ -130,5 +130,80 @@ class TestModifiersAndParser(unittest.TestCase):
         res2 = self.underwriter.underwrite(state_small)
         self.assertEqual(res2["modifier_scores"]["Years in business"]["rating"], "average")
 
+    def test_sec_collector_revenue_extraction(self):
+        # Test that SECCollectorAgent correctly chooses the best revenue key
+        # and extracts the latest annual and chronological deduplicated quarterly revenues.
+        from src.collectors import SECCollectorAgent
+        from unittest.mock import patch, MagicMock
+        import json
+        
+        collector = self.factory.create_collector_agent("sec", SECCollectorAgent)
+        
+        # Mock company tickers JSON response
+        mock_tickers = {
+            "0": {"cik_str": 1297989, "ticker": "EXLS", "title": "ExlService Holdings, Inc."}
+        }
+        
+        # Mock CIK JSON response with multiple keys (SalesRevenueNet ending 2013 and RevenueFromContractWithCustomerExcludingAssessedTax ending 2025)
+        mock_facts = {
+            "facts": {
+                "us-gaap": {
+                    "SalesRevenueNet": {
+                        "units": {
+                            "USD": [
+                                # Old 10-K entry for 2013
+                                {"start": "2013-01-01", "end": "2013-12-31", "val": 124000000, "form": "10-K", "fy": 2013, "fp": "FY", "filed": "2014-03-03"}
+                            ]
+                        }
+                    },
+                    "RevenueFromContractWithCustomerExcludingAssessedTax": {
+                        "units": {
+                            "USD": [
+                                # 2024 10-K annual entry
+                                {"start": "2024-01-01", "end": "2024-12-31", "val": 1800000000, "form": "10-K", "fy": 2024, "fp": "FY", "filed": "2025-02-25"},
+                                # 2025 10-K annual entry
+                                {"start": "2025-01-01", "end": "2025-12-31", "val": 2000000000, "form": "10-K", "fy": 2025, "fp": "FY", "filed": "2026-02-24"},
+                                # 2025 Q1 10-Q entry (3-month duration)
+                                {"start": "2025-01-01", "end": "2025-03-31", "val": 450000000, "form": "10-Q", "fy": 2025, "fp": "Q1", "filed": "2025-05-01"},
+                                # 2025 Q2 10-Q entry (3-month duration)
+                                {"start": "2025-04-01", "end": "2025-06-30", "val": 480000000, "form": "10-Q", "fy": 2025, "fp": "Q2", "filed": "2025-08-01"},
+                                # 2025 Q2 YTD 10-Q entry (6-month duration, should be ignored for quarterly list)
+                                {"start": "2025-01-01", "end": "2025-06-30", "val": 930000000, "form": "10-Q", "fy": 2025, "fp": "Q2", "filed": "2025-08-01"}
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+        
+        # Mock urlopen calls
+        def mock_urlopen(req, *args, **kwargs):
+            url = req.full_url if hasattr(req, 'full_url') else req
+            mock_res = MagicMock()
+            mock_res.__enter__.return_value = mock_res
+            if "company_tickers.json" in url:
+                mock_res.read.return_value = json.dumps(mock_tickers).encode()
+            elif "CIK0001297989.json" in url:
+                mock_res.read.return_value = json.dumps(mock_facts).encode()
+            else:
+                mock_res.read.return_value = b"{}"
+            return mock_res
+            
+        with patch('urllib.request.urlopen', side_effect=mock_urlopen):
+            # Mock call_llm because we don't want to hit Groq API in this unit test
+            collector.call_llm = lambda prompt, temp=0.0: '{"revenue": 2000000000, "fiscal_year": 2025, "subsidiaries_count": 0, "quarterly_revenue": []}'
+            import asyncio
+            res = asyncio.run(collector.collect("ExlService Holdings, Inc.", "exlservice.com"))
+            
+            self.assertEqual(res["status"], "success")
+            findings = res["findings"]
+            
+            # Annual revenue should be the latest (2,000,000,000) from the newer key
+            self.assertEqual(findings["revenue"], 2000000000)
+            self.assertEqual(findings["fiscal_year"], 2025)
+            
+            # Quarterly revenue list should contain the two 3-month period values (450M and 480M) but ignore the 6-month YTD one (930M)
+            self.assertEqual(findings["quarterly_revenue"], [450000000, 480000000])
+
 if __name__ == "__main__":
     unittest.main()

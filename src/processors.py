@@ -74,7 +74,7 @@ class CollectionCoordinatorAgent(BaseCoordinatorAgent):
                 break
             val_count = get_val(src, "subsidiaries_count")
             if val_count is not None:
-                merged["subsidiaries"] = ["Exhibit 21 Subsidiary"] * val_count
+                merged["subsidiaries"] = ["Company Placeholder"] * val_count
                 break
 
         # Acquisitions Priority
@@ -161,6 +161,8 @@ class CollectionCoordinatorAgent(BaseCoordinatorAgent):
         # Apply LLM overrides to merged profile
         for k, v in reconciled.items():
             if k in merged and v is not None:
+                if isinstance(v, list) and len(v) == 0 and isinstance(merged[k], list) and len(merged[k]) > 0:
+                    continue
                 merged[k] = v
 
         # Re-verify USA Presence
@@ -275,6 +277,8 @@ class UnderwriterAgent(BaseUnderwriterAgent):
                 pts = 2.0
             
             recency = acq.get("recency_years", 5.0)
+            if recency > 1900:
+                recency = datetime.now().year - recency
             if recency < 1.0:
                 mult = 2.0
             elif recency < 2.0:
@@ -324,7 +328,7 @@ class UnderwriterAgent(BaseUnderwriterAgent):
         # Sensitive Info
         cust_type = str(reconciled.get("customer_type", "B2B")).upper()
         has_ecom = reconciled.get("has_ecommerce", False)
-        if "B2C" in cust_type:
+        if "B2C" in cust_type or "MIX" in cust_type:
             if has_ecom:
                 sens_rating = "partially unfavourable"
             else:

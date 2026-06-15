@@ -243,23 +243,85 @@ class SECCollectorAgent(BaseCollectorAgent):
                 facts = json.loads(response.read().decode())
                 
             gaap = facts.get('facts', {}).get('us-gaap', {})
-            revenue_val = None
-            fiscal_year = None
             
-            # Extract standard annual revenues from GAAP facts
-            for rk in ['Revenues', 'SalesRevenueNet', 'RevenueFromContractWithCustomerExcludingAssessedTax']:
+            # Find the best revenue key (the one with the latest ending 10-K/annual filing)
+            best_key = None
+            best_latest_end = ""
+            best_usd = []
+            
+            from datetime import datetime
+
+            for rk in ['RevenueFromContractWithCustomerExcludingAssessedTax', 'Revenues', 'SalesRevenueNet']:
                 if rk in gaap:
                     units = gaap[rk].get('units', {})
                     usd = units.get('USD', [])
-                    valid_annuals = [u for u in usd if u.get('form') == '10-K' and 'fy' in u]
-                    if valid_annuals:
-                        latest = sorted(valid_annuals, key=lambda x: x['fy'])[-1]
-                        revenue_val = latest['val']
-                        fiscal_year = latest['fy']
-                        break
+                    # Find if there are any valid annual entries and what their latest end date is
+                    key_latest_end = ""
+                    for u in usd:
+                        if 'start' in u and 'end' in u and 'val' in u:
+                            try:
+                                start = datetime.strptime(u['start'], "%Y-%m-%d")
+                                end = datetime.strptime(u['end'], "%Y-%m-%d")
+                                days = (end - start).days
+                                if 330 <= days <= 390:
+                                    if u['end'] > key_latest_end:
+                                        key_latest_end = u['end']
+                            except Exception:
+                                pass
+                    # If this key has more recent annual data, pick it
+                    if key_latest_end and (not best_latest_end or key_latest_end > best_latest_end):
+                        best_latest_end = key_latest_end
+                        best_key = rk
+                        best_usd = usd
+
+            revenue_val = None
+            fiscal_year = None
+            quarterly_revenue = []
+
+            if best_key:
+                annual_entries = []
+                quarterly_entries = []
+                for u in best_usd:
+                    if 'start' not in u or 'end' not in u or 'val' not in u:
+                        continue
+                    try:
+                        start = datetime.strptime(u['start'], "%Y-%m-%d")
+                        end = datetime.strptime(u['end'], "%Y-%m-%d")
+                        days = (end - start).days
+                        if 330 <= days <= 390:
+                            annual_entries.append(u)
+                        elif 80 <= days <= 105:
+                            quarterly_entries.append(u)
+                    except Exception:
+                        continue
+
+                # 1. Extrapolate latest annual
+                if annual_entries:
+                    latest_annual = sorted(annual_entries, key=lambda x: (x.get('end', ''), x.get('filed', '')))[-1]
+                    revenue_val = latest_annual['val']
+                    # Use end date's year as the fiscal year if fy is missing or comparative-labeled incorrectly
+                    try:
+                        fiscal_year = int(latest_annual['end'].split('-')[0])
+                    except Exception:
+                        fiscal_year = latest_annual.get('fy')
+
+                # 2. Extrapolate quarterly revenues (sorted chronologically and deduplicated by end date)
+                if quarterly_entries:
+                    sorted_quarters = sorted(quarterly_entries, key=lambda x: (x.get('end', ''), x.get('filed', '')))
+                    dedup_quarters = {}
+                    for q in sorted_quarters:
+                        dedup_quarters[q['end']] = q['val']
+                    
+                    # Sort the unique keys chronologically
+                    chronological_ends = sorted(dedup_quarters.keys())
+                    quarterly_revenue = [dedup_quarters[e] for e in chronological_ends]
 
             # Fetch submissions to count subsidiaries if Exhibit 21 is available
             subsidiaries_count = 0
+            business_text = ""
+            risk_text = ""
+            mdna_text = ""
+            segment_text = ""
             try:
                 req_sub = urllib.request.Request(f"https://data.sec.gov/submissions/CIK{cik}.json", headers={'User-Agent': self.USER_AGENT})
                 with urllib.request.urlopen(req_sub, timeout=10) as res_sub:
@@ -283,11 +345,14 @@ class SECCollectorAgent(BaseCollectorAgent):
                         idx = json.loads(res_idx.read().decode())
                         
                     ex21_file = None
+                    primary_doc = None
                     for file_info in idx['directory']['item']:
                         name = file_info['name']
-                        if 'ex21' in name.lower() or 'ex-21' in name.lower() or 'exhibit21' in name.lower():
+                        lower_name = name.lower()
+                        if 'ex21' in lower_name or 'ex-21' in lower_name or 'exhibit21' in lower_name:
                             ex21_file = name
-                            break
+                        elif lower_name.endswith('.htm') and 'ex' not in lower_name and not primary_doc:
+                            primary_doc = name
                             
                     if ex21_file:
                         file_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_no_nodashes}/{ex21_file}"
@@ -298,6 +363,38 @@ class SECCollectorAgent(BaseCollectorAgent):
                         import re
                         rows = re.findall(r'<tr[^>]*>', html, re.IGNORECASE)
                         subsidiaries_count = max(0, len(rows) - 1)
+
+                    business_text = ""
+                    risk_text = ""
+                    mdna_text = ""
+                    segment_text = ""
+                    
+                    if primary_doc:
+                        file_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_no_nodashes}/{primary_doc}"
+                        req_file = urllib.request.Request(file_url, headers={'User-Agent': self.USER_AGENT})
+                        with urllib.request.urlopen(req_file, timeout=10) as res_file:
+                            html_10k = res_file.read().decode('utf-8', errors='ignore')
+                            
+                        import re
+                        # Strip HTML
+                        text_10k = re.sub(r'<[^>]+>', ' ', html_10k)
+                        text_10k = re.sub(r'\s+', ' ', text_10k)
+                        
+                        # Find Item 1. Business
+                        m_bus = re.search(r'(?i)Item\s+1\.\s+Business\b(.*?)(?:Item\s+1A|Item\s+2)', text_10k)
+                        if m_bus: business_text = m_bus.group(1)[:4000]
+                        
+                        # Find Item 1A. Risk Factors
+                        m_risk = re.search(r'(?i)Item\s+1A\.\s+Risk Factors\b(.*?)(?:Item\s+1B|Item\s+2)', text_10k)
+                        if m_risk: risk_text = m_risk.group(1)[:4000]
+                        
+                        # Find Item 7. MD&A
+                        m_mdna = re.search(r'(?i)Item\s+7\.\s+Management\'s Discussion(.*?)(?:Item\s+7A|Item\s+8)', text_10k)
+                        if m_mdna: mdna_text = m_mdna.group(1)[:4000]
+                        
+                        # Find Segment Reporting
+                        m_seg = re.search(r'(?i)(?:Segment Reporting|Reportable Segments)(.{0,2000})', text_10k)
+                        if m_seg: segment_text = m_seg.group(1)
             except Exception:
                 pass
 
@@ -305,7 +402,12 @@ class SECCollectorAgent(BaseCollectorAgent):
                 "cik": cik,
                 "raw_annual_revenue": revenue_val,
                 "fiscal_year": fiscal_year,
-                "exhibit21_subsidiaries_count": subsidiaries_count
+                "exhibit21_subsidiaries_count": subsidiaries_count,
+                "quarterly_revenue": quarterly_revenue,
+                "business_section": business_text,
+                "risk_factors_section": risk_text,
+                "mda_section": mdna_text,
+                "segment_reporting": segment_text
             }
 
             # Call LLM to parse and extract target fields
@@ -319,6 +421,8 @@ class SECCollectorAgent(BaseCollectorAgent):
             extracted = self.parse_json(response_text)
             
             findings = {k: extracted.get(k) for k in self.config.target_fields}
+            # Direct override to bypass LLM parsing/truncation errors
+            findings["quarterly_revenue"] = quarterly_revenue
             return {
                 "source": self.config.source_name,
                 "status": "success",
@@ -392,19 +496,40 @@ class DomainScraperCollectorAgent(BaseCollectorAgent):
             ssl_valid = False
             
         html_content = ""
-        try:
-            protocol = "https" if ssl_valid else "http"
-            url = f"{protocol}://{domain}"
-            req = urllib.request.Request(url, headers={'User-Agent': 'CyberRiskInsurancePOC/1.0'})
-            with urllib.request.urlopen(req, timeout=5) as response:
-                html_content = response.read().decode('utf-8', errors='ignore')[:10000]
-        except Exception:
-            pass
+        import re
+        
+        paths = ["", "/about", "/services", "/solutions", "/products", "/platform"]
+        protocol = "https" if ssl_valid else "http"
+        merged_text = ""
+        seen_lines = set()
+        
+        for path in paths:
+            try:
+                url = f"{protocol}://{domain}{path}"
+                req = urllib.request.Request(url, headers={'User-Agent': 'CyberRiskInsurancePOC/1.0'})
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    page_html = response.read().decode('utf-8', errors='ignore')
+                    
+                    text = re.sub(r'<style.*?>.*?</style>', ' ', page_html, flags=re.DOTALL | re.IGNORECASE)
+                    text = re.sub(r'<script.*?>.*?</script>', ' ', text, flags=re.DOTALL | re.IGNORECASE)
+                    text = re.sub(r'<[^>]+>', ' ', text)
+                    text = re.sub(r'\s+', ' ', text)
+                    
+                    chunks = text.split('.')
+                    for c in chunks:
+                        c = c.strip()
+                        if len(c) > 15 and c not in seen_lines:
+                            seen_lines.add(c)
+                            merged_text += c + ". "
+            except Exception:
+                pass
+                
+        merged_text = merged_text[:12000]
 
         raw_context = {
             "url": domain,
             "https_encrypted": ssl_valid,
-            "homepage_html_snippet": html_content
+            "homepage_html_snippet": merged_text
         }
         
         try:

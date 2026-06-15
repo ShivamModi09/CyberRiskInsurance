@@ -76,7 +76,17 @@ SEC Context:
 Your output JSON must contain:
 - "revenue": numerical annual revenue or null.
 - "fiscal_year": numerical year of the latest 10-K (e.g., 2024).
+- "business_segments": list of strings (operating segments mentioned).
+- "geographic_revenue_or_regions": list of strings.
 - "subsidiaries_count": numerical count of exhibit 21 subsidiaries.
+- "subsidiaries_list": list of strings representing subsidiary names, if available.
+- "acquisitions_mentions": list of strings representing recent acquisitions mentioned.
+- "risk_factor_keywords": list of strings (e.g., cybersecurity, data privacy, service disruption).
+- "cybersecurity_mentions": boolean (whether cybersecurity is explicitly mentioned as a risk or initiative).
+- "cloud_technology_mentions": boolean (whether cloud technology/services are mentioned).
+- "customer_data_mentions": boolean (whether handling customer data or PII is mentioned).
+- "filing_url": string URL to the latest annual report or 10-K filing.
+- "quarterly_revenue": list of numerical quarterly revenues or empty list.
 """,
     required_vars=["company_name", "domain", "sec_text"]
 )
@@ -85,7 +95,12 @@ SEC = CollectorAgentConfig(
     name="SEC EDGAR Collector",
     agent_type="sec",
     prompt_template=SEC_PROMPT,
-    target_fields=["revenue", "fiscal_year", "subsidiaries_count"],
+    target_fields=[
+        "revenue", "fiscal_year", "business_segments", "geographic_revenue_or_regions",
+        "subsidiaries_count", "subsidiaries_list", "acquisitions_mentions", "risk_factor_keywords",
+        "cybersecurity_mentions", "cloud_technology_mentions", "customer_data_mentions", "filing_url",
+        "quarterly_revenue"
+    ],
     source_name="SECCollector"
 )
 
@@ -129,6 +144,15 @@ Your output JSON must contain:
 - "compliance_mentions": list of strings (compliance frameworks mentioned in the HTML snippet, e.g. GDPR, CCPA, HIPAA).
 - "customer_type": "B2B" or "B2C" or "MIX" or null.
 - "has_ecommerce": boolean (whether there are e-commerce/store/checkout indicators like shopping cart, shop, pricing, payment buttons, or catalog purchase flows in the HTML snippet).
+- "industries_served": list of strings (e.g. insurance, healthcare, banking, retail).
+- "customer_segments": list of strings (e.g. enterprise, business clients).
+- "business_model": string (e.g. B2B services / consulting).
+- "b2b_b2c_confidence": string (e.g. high, medium, low).
+- "ecommerce_evidence": string (e.g. No checkout/cart/payment flow detected).
+- "cloud_saas_indicators": list of strings (e.g. platform, analytics, AI).
+- "data_sensitive_indicators": list of strings (e.g. healthcare, insurance, financial services).
+- "privacy_policy_url": string (extracted URL).
+- "terms_url": string (extracted URL).
 """,
     required_vars=["company_name", "domain", "scraper_text"]
 )
@@ -137,7 +161,12 @@ DOMAIN = CollectorAgentConfig(
     name="Domain Scraper",
     agent_type="domain",
     prompt_template=DOMAIN_PROMPT,
-    target_fields=["domains", "privacy_policy_published", "compliance_mentions", "customer_type", "has_ecommerce"],
+    target_fields=[
+        "domains", "privacy_policy_published", "compliance_mentions", "customer_type", "has_ecommerce",
+        "industries_served", "customer_segments", "business_model", "b2b_b2c_confidence",
+        "ecommerce_evidence", "cloud_saas_indicators", "data_sensitive_indicators",
+        "privacy_policy_url", "terms_url"
+    ],
     source_name="DomainScraper"
 )
 
@@ -234,7 +263,7 @@ UNDERWRITING MODIFIER RULES:
 7. Organizational Complexity: Subsidiary count vs revenue tier.
 8. Privacy Regulation: Policy published + Compliance frameworks count.
 9. Seasonality of sales: CV of quarterly revenue (CV < 0.1 Favourable, > 0.25 Unfavourable) or SIC benchmark.
-10. Volatility/Recovery in Sales: Avg of digital exposure, disruption speed, recovery complexity.
+10. Volatility/Recovery in Sales: Avg of digital exposure, disruption speed, recovery complexity out of 5.
 11. Applicability of Privacy Regulation: Operates in strict regions (GDPR, CCPA) or has e-commerce.
 12. B2C End Products: B2C = average risk, B2B = favourable.
 13. Years in business: founding year vs current year compared against revenue-tier thresholds.
