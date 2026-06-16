@@ -20,6 +20,7 @@ async def main_async():
     parser.add_argument("--rule", type=str, help="Rule ID to run (e.g. cyber_risk_rating)")
     parser.add_argument("--company", type=str, help="Company name to evaluate")
     parser.add_argument("--domain", type=str, help="Company domain (e.g. techgiant.com)")
+    parser.add_argument("--report", action="store_true", help="Generate HTML underwriting audit report")
     
     args = parser.parse_args()
 
@@ -266,10 +267,11 @@ async def main_async():
         cache_mgr.write(company_name, domain, profile_summary)
         print("\n> Saved raw collector evidence to cache database.")
 
-    # Generate Audit Report
-    from src.report_generator import generate_underwriting_audit_report
-    generate_underwriting_audit_report(final_state, company_name, domain, rule_id)
-    print("\nAudit report generated: underwriting_audit_report.html")
+    if args.report:
+        from reports.report_generator import generate_underwriting_audit_report
+        generate_underwriting_audit_report(final_state, company_name, domain, rule_id)
+        print("\nAudit report generated: reports/underwriting_audit_report.html")
+
 
 def main():
     asyncio.run(main_async())

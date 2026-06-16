@@ -36,4 +36,4 @@ data/cyber_rater_modifier_summary.pdf
 
 # Exclude run logs and generated audit reports
 logs/
-underwriting_audit_report.html
+reports/

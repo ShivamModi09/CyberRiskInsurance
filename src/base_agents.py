@@ -43,8 +43,9 @@ class BaseAgent:
         logger.info(f"[{agent_name}] Invoking LLM for prompt/extraction...")
 
         # Initialize the live Groq model
+        model_name = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
         llm = ChatGroq(
-            model="llama-3.3-70b-versatile",
+            model=model_name,
             api_key=api_key,
             temperature=temperature
         )

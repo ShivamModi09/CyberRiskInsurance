@@ -146,7 +146,7 @@ def build_cyber_risk_rating_graph(enable_cache: bool = True):
         # Add Business Rule to input variables
         state["business_rule"] = underwriter.config.business_rule
         res = underwriter.underwrite(state)
-        return {"risk_assessment": res, **res}
+        return {"risk_assessment": res, **res, "token_summary": factory.tracker.get_summary()}
 
     # 2. Build graph structure
     g = StateGraph(CyberRiskRatingState)
