@@ -74,6 +74,12 @@ class CachingCollectorWrapper:
         self.cache_manager = cache_manager
 
     async def collect(self, company_name: str, domain: str) -> Dict[str, Any]:
+        from src.utils.logger import get_agent_logger
+        agent_name = getattr(self.base_collector.config, 'name', self.source_type)
+        logger = get_agent_logger(agent_name)
+        
+        logger.info(f"[{agent_name}] Starting data collection for {company_name} ({domain})")
+        
         if self.cache_manager and self.cache_manager.enabled:
             cached = self.cache_manager.lookup(company_name, domain)
             if cached:
@@ -88,8 +94,12 @@ class CachingCollectorWrapper:
                 }
                 mapped_name = source_mapping.get(self.source_type, self.source_type)
                 if mapped_name in evidence:
-                    return evidence[mapped_name]
+                    logger.info(f"[{agent_name}] Cache hit. Restored cached findings.")
+                    res = evidence[mapped_name]
+                    logger.info(f"[{agent_name}] Extraction complete (cached): status={res.get('status', 'success')}, findings={res.get('findings')}")
+                    return res
                     
-        # Cache miss: run raw collector
+        logger.info(f"[{agent_name}] Cache miss. Executing live harvesting...")
         result = await self.base_collector.collect(company_name, domain)
+        logger.info(f"[{agent_name}] Extraction complete: status={result.get('status')}, findings={result.get('findings')}")
         return result

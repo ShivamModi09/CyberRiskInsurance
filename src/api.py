@@ -64,6 +64,9 @@ async def analyze_company(req: AnalysisRequest):
         "audit_logs": []
     }
 
+    from src.utils.logger import start_run_logging
+    start_run_logging(rule_id, company_name)
+
     try:
         final_state = await graph.ainvoke(initial_state)
     except Exception as e:
@@ -134,10 +137,54 @@ async def analyze_company(req: AnalysisRequest):
         "humanEscalation": final_state.get("human_escalation_flag", False)
     }
 
+    # Format Wikidata Output
+    wikidata_report = final_state.get("collected_evidence", {}).get("Wikidata", {})
+    if wikidata_report.get("status") == "success":
+        wd_findings = wikidata_report.get("findings", {})
+        
+        ind = wd_findings.get("industry")
+        if isinstance(ind, list) and ind:
+            industry_str = ", ".join(str(i) for i in ind)
+        elif ind:
+            industry_str = str(ind)
+        else:
+            industry_str = "Not Available"
+            
+        subs = wd_findings.get("subsidiaries")
+        if isinstance(subs, list) and subs:
+            subs_str = ", ".join(str(s) for s in subs)
+        elif subs:
+            subs_str = str(subs)
+        else:
+            subs_str = "Not Available"
+            
+        wikidata_output_formatted = {
+            "entity_name": company_name,
+            "industry": industry_str,
+            "headquarters": str(wd_findings.get("headquarters")) if wd_findings.get("headquarters") else "Not Available",
+            "country": str(wd_findings.get("country")) if wd_findings.get("country") else "Not Available",
+            "official_website": str(wd_findings.get("official_website")) if wd_findings.get("official_website") else "Not Available",
+            "founded_year": str(wd_findings.get("founding_year")) if wd_findings.get("founding_year") else "Not Available",
+            "parent_organization": "Not Available",
+            "subsidiaries": subs_str
+        }
+    else:
+        wikidata_output_formatted = {
+            "entity_name": company_name,
+            "industry": "Not Available",
+            "headquarters": "Not Available",
+            "country": "Not Available",
+            "official_website": "Not Available",
+            "founded_year": "Not Available",
+            "parent_organization": "Not Available",
+            "subsidiaries": "Not Available"
+        }
+
     return {
         "target_entity": {"name": company_name, "domain": domain},
         "workflow_trace": final_state.get("audit_logs", []),
         "reconciled_profile": reconciled_profile_formatted,
+        "wikidata_output": wikidata_output_formatted,
         "fact_checker_claims": fact_checker_claims,
         "modifiers": modifiers_formatted,
         "final_verdict": final_verdict

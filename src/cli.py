@@ -80,6 +80,9 @@ async def main_async():
         "audit_logs": []
     }
 
+    from src.utils.logger import start_run_logging
+    start_run_logging(rule_id, company_name)
+
     try:
         final_state = await app.ainvoke(initial_state)
     except Exception as e:
@@ -144,26 +147,7 @@ async def main_async():
 
     print_header("Final Underwriting Verdict Report")
     
-    print("----------------- UNDERWRITING METHODOLOGY -----------------")
-    print("* Risk Category: Represents the company's overall cyber risk tier. It is ")
-    print("  calculated by averaging the ratings of all 13 modifiers on a 1.0 to 6.0 ")
-    print("  scale (Very Favourable [1.0] to Unfavourable [6.0]).")
-    print("* Underwriting Score: Represents source data reliability and consensus. ")
-    print("  It calculates what percentage of key company facts were corroborated ")
-    print("  across sources (SEC, D&B, Wikipedia, Domain Scraper).")
-    print("")
-    
-    print("--------------- STEPS & DETAILED CALCULATIONS ---------------")
-    
-    # Step 1: Entity Validation
-    ent_status = final_state.get('entity_status', 'Match')
-    ent_details = "Company name aligns with the primary domain slug and registrar records." if ent_status == "Match" else "Company name or domain mismatch detected during supervisor analysis."
-    print(f"1. Entity Validation:")
-    print(f"   - Status: {ent_status.upper()}")
-    print(f"   - Details: {ent_details}")
-    print("")
-    
-    # Step 2: Risk Category Evaluation
+    # Calculate Risk Category evaluation metrics
     rating_scores_map = {
         "very favourable": 1.0,
         "favourable": 2.0,
@@ -173,17 +157,59 @@ async def main_async():
         "unfavourable": 6.0
     }
     scores_list = []
-    print(f"2. Risk Category Evaluation (13 Modifiers):")
-    print(f"   - Mapped Scores:")
     for mod, details in final_state.get("modifier_scores", {}).items():
         rat = details.get("rating", "average").lower()
         val = rating_scores_map.get(rat, 4.0)
         scores_list.append(val)
-        print(f"     - {mod}: {val} ({rat.title()})")
-    
+        
     sum_scores = sum(scores_list) if scores_list else 0.0
     avg_score = sum_scores / len(scores_list) if scores_list else 4.0
     
+    risk_cat = final_state.get('risk_category', 'Average').upper()
+    accuracy_score = final_state.get('confidence_score', 0.0)
+    conf_band = final_state.get('confidence_band', 'Low').upper()
+    
+    escalation_flag = final_state.get('human_escalation_flag', False)
+    if escalation_flag:
+        esc_status = "HUMAN ESCALATION REQUIRED"
+        if accuracy_score < 50.0:
+            esc_reason = f"Automatically triggered because the corroboration Underwriting Score ({accuracy_score:.1f}%) is below 50.0%."
+        elif final_state.get('mismatch_flag'):
+            esc_reason = "Automatically triggered because an entity name or domain mismatch was detected."
+        else:
+            esc_reason = "Automatically triggered due to discrepancy flags or conflict warnings detected between sources."
+    else:
+        esc_status = "NO ESCALATION REQUIRED"
+        esc_reason = "All underwriting data is verified with sufficient confidence."
+
+    company_display = company_name[:32] + "..." if len(company_name) > 35 else company_name
+    lines = [
+        f"  Target Company:      {company_display}",
+        f"  Risk Category:       {risk_cat}",
+        f"  Average Score:       {avg_score:.3f} / 6.0",
+        f"  Underwriting Score:  {accuracy_score:.1f}% ({conf_band})",
+        f"  Escalation Status:   {esc_status}"
+    ]
+
+    print("┌──────────────────────────────────────────────────────────┐")
+    print("│              UNDERWRITING DECISION SUMMARY               │")
+    print("├──────────────────────────────────────────────────────────┤")
+    for line in lines:
+        print(f"│ {line:<56} │")
+    print("└──────────────────────────────────────────────────────────┘")
+    print("")
+    
+    print("--------------- STEPS & DETAILED CALCULATIONS ---------------")
+    
+    # Step 1: Entity Validation
+    ent_status = final_state.get('entity_status', 'Match')
+    ent_details = "Company name aligns with the primary domain slug and registrar records." if ent_status == "Match" else "Company name or domain mismatch detected during supervisor analysis."
+    print("1. Entity Validation:")
+    print(f"   - Status:  {ent_status.upper()}")
+    print(f"   - Details: {ent_details}")
+    print("")
+    
+    # Step 2: Risk Category Evaluation
     if avg_score < 2.0: range_str = "Very Favourable range of 1.0 to 2.0"
     elif avg_score < 3.0: range_str = "Favourable range of 2.0 to 3.0"
     elif avg_score < 4.0: range_str = "Partially Favourable range of 3.0 to 4.0"
@@ -191,8 +217,8 @@ async def main_async():
     elif avg_score < 5.5: range_str = "Partially Unfavourable range of 4.5 to 5.5"
     else: range_str = "Unfavourable range of 5.5 to 6.0"
     
-    risk_cat = final_state.get('risk_category', 'Average').upper()
-    print(f"   - Math: Sum of scores ({sum_scores:.1f}) / 13 Modifiers = {avg_score:.3f} Average")
+    print("2. Risk Category Evaluation (13 Modifiers):")
+    print(f"   - Math:    Sum of scores ({sum_scores:.1f}) / 13 Modifiers = {avg_score:.3f} Average")
     print(f"   - Verdict: {risk_cat} (Average falls in the {range_str})")
     print("")
     
@@ -200,7 +226,6 @@ async def main_async():
     verified_claims = 0
     partially_verified_claims = 0
     unsupported_claims = 0
-    
     verified_names = []
     partially_names = []
     unsupported_names = []
@@ -218,36 +243,18 @@ async def main_async():
             unsupported_names.append(claim)
             
     total_claims = len(final_state.get("claims_verification", {}))
-    accuracy_score = final_state.get('confidence_score', 0.0)
-    conf_band = final_state.get('confidence_band', 'Low').upper()
     
-    print(f"3. Data Verification & Underwriting Score:")
-    print(f"   - Claims Corroboration:")
-    print(f"     - {verified_claims:.1f} claim{'s' if verified_claims != 1 else ''} Verified ({', '.join(verified_names) if verified_names else 'None'})")
-    print(f"     - {partially_verified_claims:.1f} claim{'s' if partially_verified_claims != 1 else ''} Partially Verified ({', '.join(partially_names) if partially_names else 'None'})")
-    print(f"     - {unsupported_claims:.1f} claim{'s' if unsupported_claims != 1 else ''} Unsupported ({', '.join(unsupported_names) if unsupported_names else 'None'})")
-    
-    print(f"   - Math: ({verified_claims:.1f} Verified + {partially_verified_claims * 0.5:.1f} Partially Verified) / {total_claims} total claims = {accuracy_score:.1f}%")
-    print(f"   - Verdict: {accuracy_score:.1f}% (Confidence Band: {conf_band} because the score is {'below 50.0%' if accuracy_score < 50.0 else '50.0% or above'})")
+    print("3. Data Verification & Underwriting Score:")
+    print(f"   - Claims:  {verified_claims} Verified, {partially_verified_claims} Partially Verified, {unsupported_claims} Unsupported")
+    print(f"   - Math:    ({verified_claims:.1f} Verified + {partially_verified_claims * 0.5:.1f} Partially Verified) / {total_claims} total claims = {accuracy_score:.1f}%")
+    print(f"   - Verdict: {accuracy_score:.1f}% (Confidence Band: {conf_band})")
     print("")
     
     # Step 4: Referral & Human Escalation
-    escalation_flag = final_state.get('human_escalation_flag', False)
-    if escalation_flag:
-        esc_status = "HUMAN ESCALATION REQUIRED"
-        if accuracy_score < 50.0:
-            esc_reason = f"Automatically triggered because the corroboration Underwriting Score ({accuracy_score:.1f}%) is below 50.0%."
-        elif final_state.get('mismatch_flag'):
-            esc_reason = "Automatically triggered because an entity name or domain mismatch was detected."
-        else:
-            esc_reason = "Automatically triggered due to discrepancy flags or conflict warnings detected between sources."
-    else:
-        esc_status = "NO ESCALATION REQUIRED"
-        esc_reason = "All underwriting data is verified with sufficient confidence."
-        
-    print(f"4. Referral & Human Escalation:")
-    print(f"   - Status: {esc_status}")
-    print(f"   - Reason: {esc_reason}")
+    print("4. Referral & Human Escalation:")
+    print(f"   - Status:  {esc_status}")
+    print(f"   - Reason:  {esc_reason}")
+    print("────────────────────────────────────────────────────────────")
 
     # Write Cache on success
     if final_state.get("valid") and not final_state.get("cache_hit"):
@@ -258,6 +265,11 @@ async def main_async():
         }
         cache_mgr.write(company_name, domain, profile_summary)
         print("\n> Saved raw collector evidence to cache database.")
+
+    # Generate Audit Report
+    from src.report_generator import generate_underwriting_audit_report
+    generate_underwriting_audit_report(final_state, company_name, domain, rule_id)
+    print("\nAudit report generated: underwriting_audit_report.html")
 
 def main():
     asyncio.run(main_async())

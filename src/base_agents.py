@@ -11,6 +11,11 @@ class BaseAgent:
         self.config = config
         self.tracker = tracker
 
+    def get_logger(self) -> Any:
+        from src.utils.logger import get_agent_logger
+        agent_name = getattr(self.config, 'name', self.__class__.__name__)
+        return get_agent_logger(agent_name)
+
     def format_prompt(self, template: PromptTemplate, **kwargs) -> str:
         # Framework default variables
         now = datetime.now()
@@ -33,6 +38,10 @@ class BaseAgent:
         if not api_key:
             raise ValueError("GROQ_API_KEY environment variable is missing. Live Groq API execution is required in production.")
 
+        logger = self.get_logger()
+        agent_name = getattr(self.config, 'name', self.__class__.__name__)
+        logger.info(f"[{agent_name}] Invoking LLM for prompt/extraction...")
+
         # Initialize the live Groq model
         llm = ChatGroq(
             model="llama-3.3-70b-versatile",
@@ -42,15 +51,28 @@ class BaseAgent:
         
         try:
             res = llm.invoke(prompt)
+            prompt_tokens = 0
+            completion_tokens = 0
+            
             # Track token usage if tracker is present
-            if self.tracker and hasattr(res, 'response_metadata') and res.response_metadata:
+            if hasattr(res, 'response_metadata') and res.response_metadata:
                 token_usage = res.response_metadata.get('token_usage', {})
                 if token_usage:
                     prompt_tokens = token_usage.get('prompt_tokens', 0)
                     completion_tokens = token_usage.get('completion_tokens', 0)
-                    self.tracker.add_usage(prompt_tokens, completion_tokens)
+                    if self.tracker:
+                        self.tracker.add_usage(prompt_tokens, completion_tokens)
+            
+            # Calculate cost estimate based on $0.59/M input, $0.79/M output
+            cost = (prompt_tokens * 0.59 + completion_tokens * 0.79) / 1000000.0
+            
+            # Log usage & outputs
+            logger.info(f"[{agent_name}] LLM Response received. Usage: input={prompt_tokens}, output={completion_tokens}, reasoning=0, cached=0, tool_calls=0, cost=${cost:.6f}")
+            logger.info(f"[{agent_name}] Output text:\n{str(res.content)}")
+            
             return str(res.content)
         except Exception as e:
+            logger.error(f"[{agent_name}] LLM invocation failed: {e}")
             raise RuntimeError(f"Error calling live Groq model: {e}")
 
     def parse_json(self, text: str) -> Dict[str, Any]:

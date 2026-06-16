@@ -44,3 +44,15 @@ export const finalVerdict = {
   confidenceBand: "Low",
   humanEscalation: true,
 };
+
+export const wikidataOutput = {
+  entity_name: "Liberty Mutual Insurance",
+  industry: "Insurance",
+  headquarters: "Boston",
+  country: "United States",
+  official_website: "https://www.libertymutual.com",
+  founded_year: "1912",
+  parent_organization: "Not Available",
+  subsidiaries: "Safeco, Ironshore"
+};
+

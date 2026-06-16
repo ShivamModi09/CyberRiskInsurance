@@ -26,6 +26,7 @@ Your output JSON must contain:
 - "has_ecommerce": boolean or null (whether they sell products/services online directly via digital checkout).
 - "country": string name of the primary country mentioned (e.g. USA, India).
 - "founding_year": numerical year when the company was founded (e.g. 1998), or null if not found.
+- "industry_classification": list of strings (primary industry and business model keywords).
 """,
     required_vars=["company_name", "domain", "wikipedia_text"]
 )
@@ -34,7 +35,7 @@ WIKIPEDIA = CollectorAgentConfig(
     name="Wikipedia Collector",
     agent_type="wikipedia",
     prompt_template=WIKIPEDIA_PROMPT,
-    target_fields=["subsidiaries", "acquisitions", "customer_type", "has_ecommerce", "country", "founding_year"],
+    target_fields=["subsidiaries", "acquisitions", "customer_type", "has_ecommerce", "country", "founding_year", "industry_classification"],
     source_name="Wikipedia"
 )
 
@@ -50,7 +51,8 @@ Your output JSON must contain:
 - "employees": numerical value of employee count or null.
 - "country": string name of primary country.
 - "headquarters": string name of headquarters city.
-- "industry": list of strings for industry sectors.
+- "industry": list of strings for primary industry sectors.
+- "sub_industries": list of strings for sub-industries and business model keywords.
 - "official_website": string URL.
 - "subsidiaries": list of string names of subsidiaries.
 - "founding_year": numerical year when the company was founded (extracted from inception property), or null if not found.
@@ -62,7 +64,7 @@ WIKIDATA = CollectorAgentConfig(
     name="Wikidata Collector",
     agent_type="wikidata",
     prompt_template=WIKIDATA_PROMPT,
-    target_fields=["revenue", "employees", "country", "headquarters", "industry", "official_website", "subsidiaries", "founding_year"],
+    target_fields=["revenue", "employees", "country", "headquarters", "industry", "sub_industries", "official_website", "subsidiaries", "founding_year"],
     source_name="Wikidata"
 )
 
@@ -153,6 +155,7 @@ Your output JSON must contain:
 - "data_sensitive_indicators": list of strings (e.g. healthcare, insurance, financial services).
 - "privacy_policy_url": string (extracted URL).
 - "terms_url": string (extracted URL).
+- "products_services_portfolio": list of strings (e.g. products, services, platforms, SaaS indicators, cloud offerings, payment offerings, healthcare offerings, insurance offerings).
 """,
     required_vars=["company_name", "domain", "scraper_text"]
 )
@@ -165,7 +168,7 @@ DOMAIN = CollectorAgentConfig(
         "domains", "privacy_policy_published", "compliance_mentions", "customer_type", "has_ecommerce",
         "industries_served", "customer_segments", "business_model", "b2b_b2c_confidence",
         "ecommerce_evidence", "cloud_saas_indicators", "data_sensitive_indicators",
-        "privacy_policy_url", "terms_url"
+        "privacy_policy_url", "terms_url", "products_services_portfolio"
     ],
     source_name="DomainScraper"
 )
