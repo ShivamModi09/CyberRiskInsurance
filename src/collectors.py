@@ -666,57 +666,173 @@ class DomainScraperCollectorAgent(BaseCollectorAgent):
 
     async def collect(self, company_name: str, domain: str) -> Dict[str, Any]:
         import re
+        import asyncio
         logger = self.get_logger()
-        logger.info(f"[Domain Scraper Collector] Starting collection for '{company_name}' on domain '{domain}'")
+        logger.info(f"[Domain Scraper Collector] Starting recursive collection for '{company_name}' on domain '{domain}'")
 
-        ssl_valid = False
-        try:
-            context = ssl.create_default_context()
-            logger.info(f"[Domain Scraper Collector] Performing SSL handshake check for {domain}:443")
-            with socket.create_connection((domain, 443), timeout=5) as sock:
-                with context.wrap_socket(sock, server_hostname=domain) as ssock:
-                    ssock.getpeercert()
-                    ssl_valid = True
-            logger.info(f"[Domain Scraper Collector] SSL handshake successful for {domain}")
-        except Exception as e:
-            logger.info(f"[Domain Scraper Collector] SSL check failed for {domain}: {e}")
-            ssl_valid = False
+        # 1. Brand Keywords Extraction
+        words = re.findall(r'[a-zA-Z0-9]+', company_name.lower())
+        ignored_suffixes = {"inc", "corp", "corporation", "ltd", "limited", "co", "llc", "group", "pc", "intl", "international", "incorporated", "llp", "company", "plc"}
+        brand_keywords = [w for w in words if w not in ignored_suffixes and len(w) > 2]
+        if not brand_keywords:
+            brand_keywords = [w for w in words if len(w) > 1]
+            
+        logger.info(f"[Domain Scraper Collector] Brand keywords: {brand_keywords}")
 
-        paths = ["", "/about", "/services", "/solutions", "/products", "/platform"]
-        protocol = "https" if ssl_valid else "http"
+        # 2. Helpers for SSL, crt.sh query, and URL fetching
+        async def check_ssl(domain_str: str) -> bool:
+            def blocking_ssl_check():
+                try:
+                    context = ssl.create_default_context()
+                    with socket.create_connection((domain_str, 443), timeout=3) as sock:
+                        with context.wrap_socket(sock, server_hostname=domain_str) as ssock:
+                            ssock.getpeercert()
+                            return True
+                except Exception:
+                    return False
+            return await asyncio.to_thread(blocking_ssl_check)
+
+        async def discover_crtsh(domain_str: str) -> set:
+            def blocking_query():
+                subdomains = set()
+                try:
+                    query_url = f"https://crt.sh/?q={urllib.parse.quote(domain_str)}&output=json"
+                    req = urllib.request.Request(query_url, headers={'User-Agent': 'CyberRiskInsurancePOC/1.0'})
+                    with urllib.request.urlopen(req, timeout=4) as response:
+                        data = json.loads(response.read().decode('utf-8'))
+                        for entry in data:
+                            name_value = entry.get("name_value", "")
+                            for name in name_value.split("\n"):
+                                name = name.strip().lower()
+                                if name.startswith("*."):
+                                    name = name[2:]
+                                if name:
+                                    subdomains.add(name)
+                except Exception as e:
+                    logger.info(f"[Domain Scraper Collector] crt.sh query failed for {domain_str}: {e}")
+                return subdomains
+            return await asyncio.to_thread(blocking_query)
+
+        async def scrape_url(url_str: str) -> tuple[str, set[str]]:
+            def blocking_fetch():
+                text = ""
+                links = set()
+                try:
+                    req = urllib.request.Request(url_str, headers={'User-Agent': 'CyberRiskInsurancePOC/1.0'})
+                    with urllib.request.urlopen(req, timeout=4) as response:
+                        page_bytes = response.read()
+                        page_html = page_bytes.decode('utf-8', errors='ignore')
+                        
+                        # Extract absolute domains from link tags
+                        found_domains = re.findall(r'https?://([a-zA-Z0-9.-]+)', page_html)
+                        for d in found_domains:
+                            d = d.lower()
+                            if d.startswith("www."):
+                                d = d[4:]
+                            if d:
+                                links.add(d)
+
+                        # Clean HTML tags and scripts
+                        cleaned = re.sub(r'<style.*?>.*?</style>', ' ', page_html, flags=re.DOTALL | re.IGNORECASE)
+                        cleaned = re.sub(r'<script.*?>.*?</script>', ' ', cleaned, flags=re.DOTALL | re.IGNORECASE)
+                        cleaned = re.sub(r'<[^>]+>', ' ', cleaned)
+                        cleaned = re.sub(r'\s+', ' ', cleaned)
+                        text = cleaned
+                except Exception as e:
+                    logger.info(f"[Domain Scraper Collector] Fetch failed for {url_str}: {e}")
+                return text, links
+            return await asyncio.to_thread(blocking_fetch)
+
+        # 3. Filtering Helper
+        def is_valid_domain(candidate: str) -> bool:
+            candidate = candidate.lower()
+            # Rule A: Subdomain of primary domain
+            if candidate == domain.lower() or candidate.endswith("." + domain.lower()):
+                return True
+            # Rule B: Alternate domain matching brand keywords
+            for keyword in brand_keywords:
+                if keyword in candidate:
+                    return True
+            return False
+
+        discovered_domains = {domain.lower()}
+        crawled_domains = set()
+        domain_ssl_status = {}
+
+        # Stage 1: SSL Check and Page Crawl for Primary Domain + crt.sh Discovery
+        primary_ssl = await check_ssl(domain)
+        domain_ssl_status[domain.lower()] = primary_ssl
+
+        protocol = "https" if primary_ssl else "http"
+        primary_paths = ["", "/about", "/services", "/solutions", "/products", "/platform"]
+        primary_urls = [f"{protocol}://{domain.lower()}{p}" for p in primary_paths]
+
+        logger.info(f"[Domain Scraper Collector] Stage 1: Scraping primary domain and querying crt.sh...")
+        stage1_tasks = [scrape_url(url) for url in primary_urls]
+        stage1_tasks.append(discover_crtsh(domain))
+
+        stage1_results = await asyncio.gather(*stage1_tasks)
+
+        primary_pages_results = stage1_results[:-1]
+        crtsh_subdomains = stage1_results[-1]
+
         merged_text = ""
-        seen_lines: set = set()
+        seen_lines = set()
+        all_discovered_links = set(crtsh_subdomains)
 
-        for path in paths:
-            try:
-                url = f"{protocol}://{domain}{path}"
-                logger.info(f"[Domain Scraper Collector] Requesting page URL: {url}")
-                req = urllib.request.Request(url, headers={'User-Agent': 'CyberRiskInsurancePOC/1.0'})
-                with urllib.request.urlopen(req, timeout=5) as response:
-                    page_bytes = response.read()
-                    logger.info(f"[Domain Scraper Collector] Received response for {url} ({len(page_bytes)} bytes)")
-                    page_html = page_bytes.decode('utf-8', errors='ignore')
+        for text, links in primary_pages_results:
+            all_discovered_links.update(links)
+            if text:
+                chunks = text.split('.')
+                for c in chunks:
+                    c = c.strip()
+                    if len(c) > 15 and c not in seen_lines:
+                        seen_lines.add(c)
+                        merged_text += c + ". "
 
-                    text = re.sub(r'<style.*?>.*?</style>', ' ', page_html, flags=re.DOTALL | re.IGNORECASE)
-                    text = re.sub(r'<script.*?>.*?</script>', ' ', text, flags=re.DOTALL | re.IGNORECASE)
-                    text = re.sub(r'<[^>]+>', ' ', text)
-                    text = re.sub(r'\s+', ' ', text)
+        crawled_domains.add(domain.lower())
 
+        # Stage 2: Filter and Limit Discovered Subdomains / Alternate Domains
+        candidates = [link for link in all_discovered_links if link not in crawled_domains and is_valid_domain(link)]
+        # Cap to a maximum of 7 additional domains (making it 8 total)
+        candidates = candidates[:7]
+
+        logger.info(f"[Domain Scraper Collector] Discovered valid domain candidates: {candidates}")
+
+        if candidates:
+            # Perform parallel SSL checks
+            ssl_checks = await asyncio.gather(*[check_ssl(cand) for cand in candidates])
+            for cand, ssl_ok in zip(candidates, ssl_checks):
+                domain_ssl_status[cand] = ssl_ok
+                discovered_domains.add(cand)
+
+            # Build URLs (crawling "/" and "/about" for each candidate)
+            cand_urls = []
+            for cand in candidates:
+                proto = "https" if domain_ssl_status[cand] else "http"
+                cand_urls.append((cand, f"{proto}://{cand}"))
+                cand_urls.append((cand, f"{proto}://{cand}/about"))
+
+            logger.info(f"[Domain Scraper Collector] Stage 2: Crawling candidate pages in parallel...")
+            cand_scrape_results = await asyncio.gather(*[scrape_url(url) for _, url in cand_urls])
+
+            for (_, url), (text, links) in zip(cand_urls, cand_scrape_results):
+                if text:
                     chunks = text.split('.')
                     for c in chunks:
                         c = c.strip()
                         if len(c) > 15 and c not in seen_lines:
                             seen_lines.add(c)
                             merged_text += c + ". "
-            except Exception as e:
-                logger.info(f"[Domain Scraper Collector] Crawl failed for {domain}{path}: {e}")
 
-        merged_text = merged_text[:12000]
-        logger.info(f"[Domain Scraper Collector] Merged text size after crawl: {len(merged_text)} chars")
+        # Stage 3: Construct context and call LLM
+        domain_objects = [{"url": d, "https_encrypted": domain_ssl_status.get(d, False)} for d in discovered_domains]
+        merged_text = merged_text[:15000]
 
         raw_context = {
             "url": domain,
-            "https_encrypted": ssl_valid,
+            "https_encrypted": primary_ssl,
+            "discovered_domains": domain_objects,
             "homepage_html_snippet": merged_text
         }
 
@@ -732,11 +848,9 @@ class DomainScraperCollectorAgent(BaseCollectorAgent):
 
             findings = {k: extracted.get(k) for k in self.config.target_fields}
 
-            # Hard override if connection failed to ensure accuracy
-            if not ssl_valid and "domains" in findings:
-                findings["domains"] = [{"url": domain, "https_encrypted": False}]
-            elif ssl_valid and "domains" in findings:
-                findings["domains"] = [{"url": domain, "https_encrypted": True}]
+            # Hard override verified domains list
+            if "domains" in findings:
+                findings["domains"] = domain_objects
 
             logger.info(f"[Domain Scraper Collector] Mapped findings: {findings}")
             return {
@@ -752,7 +866,7 @@ class DomainScraperCollectorAgent(BaseCollectorAgent):
                 "status": "error",
                 "message": f"{e}\nTraceback:\n{traceback.format_exc()}",
                 "findings": {
-                    "domains": [{"url": domain, "https_encrypted": ssl_valid}]
+                    "domains": domain_objects
                 }
             }
 

@@ -126,5 +126,47 @@ class TestWorkflowIntegration(IsolatedAsyncioTestCase):
             self.assertEqual(res_hit["cache_data"]["cache_type"], "collector_cache")
             self.assertEqual(res_hit["risk_category"], res_miss["risk_category"])
 
+    async def test_domain_scraper_recursive_logic(self):
+        from src.collectors import DomainScraperCollectorAgent
+        from src.factory import AgentFactory
+        from unittest.mock import patch, MagicMock
+        
+        factory = AgentFactory.for_rule("cyber_risk_rating")
+        collector = factory.create_collector_agent("domain", DomainScraperCollectorAgent)
+        
+        def mock_urlopen_collector(req, *args, **kwargs):
+            url = req.full_url if hasattr(req, 'full_url') else req
+            mock_res = MagicMock()
+            mock_res.__enter__.return_value = mock_res
+            mock_res.status = 200
+            
+            if "crt.sh" in url:
+                mock_res.read.return_value = b'[{"name_value": "sub1.testcompany.com\\n*.testcompany.com"}]'
+            elif "testcompany.com/about" in url or "testcompany.com/services" in url or "testcompany.com/solutions" in url or "testcompany.com/products" in url or "testcompany.com/platform" in url:
+                mock_res.read.return_value = b'<html>About testcompany.com</html>'
+            elif "testcompany.com" in url:
+                mock_res.read.return_value = b'<html>Welcome to TestCompany. Visit <a href="https://alternatecompany.com">Alternate</a> and <a href="https://linkedin.com">LinkedIn</a></html>'
+            elif "alternatecompany.com/about" in url:
+                mock_res.read.return_value = b'<html>About AlternateCompany</html>'
+            elif "alternatecompany.com" in url:
+                mock_res.read.return_value = b'<html>AlternateCompany details page.</html>'
+            else:
+                mock_res.read.return_value = b'{}'
+            return mock_res
+
+        with patch('urllib.request.urlopen', side_effect=mock_urlopen_collector), \
+             patch('src.base_agents.BaseAgent.call_llm', return_value='{"domains": []}'):
+             
+             with patch('socket.create_connection') as mock_conn:
+                 # Company name contains "Alternate" so alternatecompany.com passes Rule B brand filter
+                 res = await collector.collect("TestCompany & Alternate", "testcompany.com")
+                 self.assertEqual(res["status"], "success")
+                 
+                 discovered = [d["url"] for d in res["findings"]["domains"]]
+                 self.assertIn("testcompany.com", discovered)
+                 self.assertIn("sub1.testcompany.com", discovered)
+                 self.assertIn("alternatecompany.com", discovered)
+                 self.assertNotIn("linkedin.com", discovered)
+
 if __name__ == "__main__":
     unittest.main()
