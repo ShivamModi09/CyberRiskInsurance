@@ -663,99 +663,39 @@ class DNBCollectorAgent(BaseCollectorAgent):
             }
 
 class DomainScraperCollectorAgent(BaseCollectorAgent):
-    USER_AGENT = 'CyberRiskInsurancePOC/1.0 (https://github.com/ShivamModi09/CyberRiskInsurance)'
-    CRTSH_URL = 'https://crt.sh/?q={query}&output=json'
 
-    def _check_ssl(self, host: str) -> bool:
-        """Check if the host supports HTTPS via SSL handshake."""
+    async def collect(self, company_name: str, domain: str) -> Dict[str, Any]:
+        import re
         logger = self.get_logger()
-        logger.info(f"[Domain Scraper SSL Check] Performing SSL handshake for {host}:443")
+        logger.info(f"[Domain Scraper Collector] Starting collection for '{company_name}' on domain '{domain}'")
+
+        ssl_valid = False
         try:
             context = ssl.create_default_context()
-            with socket.create_connection((host, 443), timeout=4) as sock:
-                with context.wrap_socket(sock, server_hostname=host) as ssock:
+            logger.info(f"[Domain Scraper Collector] Performing SSL handshake check for {domain}:443")
+            with socket.create_connection((domain, 443), timeout=5) as sock:
+                with context.wrap_socket(sock, server_hostname=domain) as ssock:
                     ssock.getpeercert()
-                    logger.info(f"[Domain Scraper SSL Check] SSL handshake successful for {host}")
-                    return True
+                    ssl_valid = True
+            logger.info(f"[Domain Scraper Collector] SSL handshake successful for {domain}")
         except Exception as e:
-            logger.info(f"[Domain Scraper SSL Check] SSL handshake failed for {host}: {e}")
-            return False
+            logger.info(f"[Domain Scraper Collector] SSL check failed for {domain}: {e}")
+            ssl_valid = False
 
-    def _is_reachable(self, host: str) -> bool:
-        """Check if the host is reachable on port 80 or 443."""
-        logger = self.get_logger()
-        logger.info(f"[Domain Scraper Reachability] Probing reachability for {host}")
-        for port in (443, 80):
-            try:
-                with socket.create_connection((host, port), timeout=4):
-                    logger.info(f"[Domain Scraper Reachability] Host {host} is reachable on port {port}")
-                    return True
-            except Exception:
-                continue
-        logger.info(f"[Domain Scraper Reachability] Host {host} is unreachable on ports 443 and 80")
-        return False
-
-    def _crtsh_discover(self, root_domain: str) -> list:
-        """
-        Query crt.sh Certificate Transparency logs to discover all real subdomains
-        that have ever had an SSL certificate issued for this root domain.
-        Returns a deduplicated list of host strings.
-        """
-        import re
-        logger = self.get_logger()
-        base = re.sub(r'^www\.', '', root_domain)
-        query = urllib.parse.quote(f'%.{base}')
-        url = self.CRTSH_URL.format(query=query)
-        logger.info(f"[Domain Scraper crt.sh] Querying subdomains for '{root_domain}' using base '{base}'")
-        logger.info(f"[Domain Scraper crt.sh] Requesting URL: {url}")
-        discovered = set()
-        discovered.add(root_domain)
-
-        try:
-            req = urllib.request.Request(url, headers={'User-Agent': self.USER_AGENT})
-            with urllib.request.urlopen(req, timeout=10) as response:
-                resp_bytes = response.read()
-                logger.info(f"[Domain Scraper crt.sh] Received crt.sh response ({len(resp_bytes)} bytes)")
-                entries = json.loads(resp_bytes.decode())
-            for entry in entries:
-                name = entry.get('name_value', '').strip().lower()
-                for part in name.split('\n'):
-                    part = part.strip()
-                    if part.startswith('*') or not part.endswith(base):
-                        continue
-                    if part and re.match(r'^[a-z0-9._-]+$', part):
-                        discovered.add(part)
-            logger.info(f"[Domain Scraper crt.sh] Discovered deduplicated subdomains: {list(discovered)}")
-        except Exception as e:
-            import traceback
-            logger.warning(f"[Domain Scraper crt.sh] crt.sh query failed: {e}\n{traceback.format_exc()}")
-
-        return list(discovered)
-
-    def _scrape_domain(self, host: str, ssl_valid: bool) -> tuple:
-        """
-        Scrape key pages from a single domain. Returns (text_content, is_reachable).
-        """
-        import re
-        logger = self.get_logger()
-        paths = ["", "/about", "/services", "/solutions", "/products",
-                 "/platform", "/business", "/commercial", "/corporate"]
+        paths = ["", "/about", "/services", "/solutions", "/products", "/platform"]
         protocol = "https" if ssl_valid else "http"
         merged_text = ""
-        seen_lines = set()
-        reached = False
+        seen_lines: set = set()
 
-        logger.info(f"[Domain Scraper Crawl] Crawling domain: {host} (SSL valid: {ssl_valid})")
         for path in paths:
             try:
-                url = f"{protocol}://{host}{path}"
-                logger.info(f"[Domain Scraper Crawl] Requesting page URL: {url}")
-                req = urllib.request.Request(url, headers={'User-Agent': self.USER_AGENT})
+                url = f"{protocol}://{domain}{path}"
+                logger.info(f"[Domain Scraper Collector] Requesting page URL: {url}")
+                req = urllib.request.Request(url, headers={'User-Agent': 'CyberRiskInsurancePOC/1.0'})
                 with urllib.request.urlopen(req, timeout=5) as response:
                     page_bytes = response.read()
-                    logger.info(f"[Domain Scraper Crawl] Received response for URL {url} ({len(page_bytes)} bytes)")
+                    logger.info(f"[Domain Scraper Collector] Received response for {url} ({len(page_bytes)} bytes)")
                     page_html = page_bytes.decode('utf-8', errors='ignore')
-                    reached = True
 
                     text = re.sub(r'<style.*?>.*?</style>', ' ', page_html, flags=re.DOTALL | re.IGNORECASE)
                     text = re.sub(r'<script.*?>.*?</script>', ' ', text, flags=re.DOTALL | re.IGNORECASE)
@@ -769,59 +709,15 @@ class DomainScraperCollectorAgent(BaseCollectorAgent):
                             seen_lines.add(c)
                             merged_text += c + ". "
             except Exception as e:
-                logger.info(f"[Domain Scraper Crawl] Crawl failed for page URL {host}{path}: {e}")
+                logger.info(f"[Domain Scraper Collector] Crawl failed for {domain}{path}: {e}")
 
-        logger.info(f"[Domain Scraper Crawl] Finished crawl for host {host}. Merged text size: {len(merged_text)} chars")
-        return merged_text, reached
-
-    async def collect(self, company_name: str, domain: str) -> Dict[str, Any]:
-        logger = self.get_logger()
-        all_input_domains = getattr(self, '_state_all_domains', [domain])
-        logger.info(f"[Domain Scraper Collector] Starting collection for {company_name}. Input domains: {all_input_domains}")
-
-        # 1. For each input root domain, discover subdomains via crt.sh
-        all_candidates = []
-        seen_candidates = set()
-        for root in all_input_domains:
-            for host in self._crtsh_discover(root):
-                if host not in seen_candidates:
-                    seen_candidates.add(host)
-                    all_candidates.append(host)
-
-        # 2. Probe each candidate — check reachability and SSL
-        reachable_domains = []
-        all_merged_text = ""
-        seen_text_lines: set = set()
-
-        for host in all_candidates:
-            if not self._is_reachable(host):
-                continue
-            ssl_valid = self._check_ssl(host)
-            page_text, reached = self._scrape_domain(host, ssl_valid)
-
-            if reached:
-                reachable_domains.append({"url": host, "https_encrypted": ssl_valid})
-                for chunk in page_text.split(". "):
-                    chunk = chunk.strip()
-                    if len(chunk) > 15 and chunk not in seen_text_lines:
-                        seen_text_lines.add(chunk)
-                        all_merged_text += chunk + ". "
-
-        # If nothing was reachable at all, fallback to primary domain only
-        if not reachable_domains:
-            logger.info(f"[Domain Scraper Collector] No subdomains reachable. Falling back to primary domain: {domain}")
-            ssl_primary = self._check_ssl(domain)
-            reachable_domains = [{"url": domain, "https_encrypted": ssl_primary}]
-
-        # Cap merged text for LLM
-        all_merged_text = all_merged_text[:14000]
+        merged_text = merged_text[:12000]
+        logger.info(f"[Domain Scraper Collector] Merged text size after crawl: {len(merged_text)} chars")
 
         raw_context = {
-            "primary_domain": domain,
-            "all_input_domains": all_input_domains,
-            "discovered_domains": reachable_domains,
-            "https_encrypted": any(d["https_encrypted"] for d in reachable_domains),
-            "homepage_html_snippet": all_merged_text
+            "url": domain,
+            "https_encrypted": ssl_valid,
+            "homepage_html_snippet": merged_text
         }
 
         try:
@@ -835,9 +731,14 @@ class DomainScraperCollectorAgent(BaseCollectorAgent):
             extracted = self.parse_json(response_text)
 
             findings = {k: extracted.get(k) for k in self.config.target_fields}
-            findings["domains"] = reachable_domains
-            logger.info(f"[Domain Scraper Collector] Mapped findings: {findings}")
 
+            # Hard override if connection failed to ensure accuracy
+            if not ssl_valid and "domains" in findings:
+                findings["domains"] = [{"url": domain, "https_encrypted": False}]
+            elif ssl_valid and "domains" in findings:
+                findings["domains"] = [{"url": domain, "https_encrypted": True}]
+
+            logger.info(f"[Domain Scraper Collector] Mapped findings: {findings}")
             return {
                 "source": self.config.source_name,
                 "status": "success",
@@ -851,7 +752,7 @@ class DomainScraperCollectorAgent(BaseCollectorAgent):
                 "status": "error",
                 "message": f"{e}\nTraceback:\n{traceback.format_exc()}",
                 "findings": {
-                    "domains": reachable_domains
+                    "domains": [{"url": domain, "https_encrypted": ssl_valid}]
                 }
             }
 

@@ -30,7 +30,6 @@ class CyberRiskRatingState(TypedDict, total=False):
     # Inputs
     company_name: str
     domain: str
-    all_domains: list  # comma-separated multi-domain input, parsed in cli.py
     business_rule: str
     rule_id: str
 
@@ -121,10 +120,6 @@ def build_cyber_risk_rating_graph(enable_cache: bool = True):
         return {"reports": {"DBCollector": rep}, "collected_evidence": {"DBCollector": rep}}
 
     async def domain_node(state: CyberRiskRatingState) -> dict:
-        # Inject all_domains into the underlying agent so crt.sh runs on every provided root domain
-        all_input_domains = state.get("all_domains") or [state["domain"]]
-        underlying = domain_base if not isinstance(domain_agent, CachingCollectorWrapper) else domain_agent.base_collector
-        underlying._state_all_domains = all_input_domains
         rep = await domain_agent.collect(state["company_name"], state["domain"])
         return {"reports": {"DomainScraper": rep}, "collected_evidence": {"DomainScraper": rep}}
 
