@@ -14,13 +14,21 @@ class WikipediaCollectorAgent(BaseCollectorAgent):
         query = urllib.parse.quote(company_name)
         search_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={query}&utf8=&format=json"
         
+        logger = self.get_logger()
+        logger.info(f"[Wikipedia Collector] Fetching search results for '{company_name}' using query '{query}'")
+        search_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={query}&utf8=&format=json"
+        
         try:
             req = urllib.request.Request(search_url, headers={'User-Agent': self.USER_AGENT})
+            logger.info(f"[Wikipedia Collector] Requesting URL: {search_url} with User-Agent: {self.USER_AGENT}")
             with urllib.request.urlopen(req, timeout=5) as response:
-                data = json.loads(response.read().decode())
+                resp_bytes = response.read()
+                logger.info(f"[Wikipedia Collector] Received search API response (status {response.status}, {len(resp_bytes)} bytes)")
+                data = json.loads(resp_bytes.decode())
                 
             search_results = data.get("query", {}).get("search", [])
             if not search_results:
+                logger.info(f"[Wikipedia Collector] No search results returned for query '{query}'")
                 return {
                     "source": self.config.source_name,
                     "status": "skipped",
@@ -29,19 +37,23 @@ class WikipediaCollectorAgent(BaseCollectorAgent):
                 }
                 
             title = urllib.parse.quote(search_results[0]["title"])
-            # Fetch full article (no exintro) with plain text to capture acquisitions, global ops, etc.
             summary_url = f"https://en.wikipedia.org/w/api.php?action=query&prop=extracts&explaintext=&titles={title}&format=json"
             
+            logger.info(f"[Wikipedia Collector] Requesting full extract from Wikipedia page for title '{search_results[0]['title']}'")
+            logger.info(f"[Wikipedia Collector] Requesting URL: {summary_url}")
             req2 = urllib.request.Request(summary_url, headers={'User-Agent': self.USER_AGENT})
             with urllib.request.urlopen(req2, timeout=10) as response2:
-                summary_data = json.loads(response2.read().decode())
+                resp2_bytes = response2.read()
+                logger.info(f"[Wikipedia Collector] Received extract API response (status {response2.status}, {len(resp2_bytes)} bytes)")
+                summary_data = json.loads(resp2_bytes.decode())
             
             pages = summary_data.get("query", {}).get("pages", {})
             page = list(pages.values())[0] if pages else {}
-            # Cap at 12000 chars to keep LLM prompt within safe token limits
             extract = page.get("extract", "")[:12000]
+            logger.info(f"[Wikipedia Collector] Page extract successfully retrieved. Extract preview (first 500 chars):\n{extract[:500]}...")
             
             if not extract:
+                logger.info("[Wikipedia Collector] Wikipedia extract page is empty")
                 return {
                     "source": self.config.source_name,
                     "status": "skipped",
@@ -61,16 +73,19 @@ class WikipediaCollectorAgent(BaseCollectorAgent):
             
             # Map target fields
             findings = {k: extracted.get(k) for k in self.config.target_fields}
+            logger.info(f"[Wikipedia Collector] Mapped target fields: {findings}")
             return {
                 "source": self.config.source_name,
                 "status": "success",
                 "findings": findings
             }
         except Exception as e:
+            import traceback
+            logger.error(f"[Wikipedia Collector] Collection failed: {e}\nTraceback:\n{traceback.format_exc()}")
             return {
                 "source": self.config.source_name,
                 "status": "error",
-                "message": str(e),
+                "message": f"{e}\nTraceback:\n{traceback.format_exc()}",
                 "findings": {}
             }
 
@@ -78,6 +93,7 @@ class WikidataCollectorAgent(BaseCollectorAgent):
     USER_AGENT = 'CyberRiskInsurancePOC/1.0 (https://github.com/ShivamModi09/CyberRiskInsurance)'
 
     async def collect(self, company_name: str, domain: str) -> Dict[str, Any]:
+        logger = self.get_logger()
         try:
             # 1. Search entities
             query = urllib.parse.urlencode({
@@ -90,11 +106,16 @@ class WikidataCollectorAgent(BaseCollectorAgent):
             url = f'https://www.wikidata.org/w/api.php?{query}'
             req = urllib.request.Request(url, headers={'User-Agent': self.USER_AGENT})
             
+            logger.info(f"[Wikidata Collector] Resolving entity for search: '{company_name}'")
+            logger.info(f"[Wikidata Collector] Requesting URL: {url}")
             with urllib.request.urlopen(req, timeout=10) as response:
-                data = json.loads(response.read().decode())
+                resp_bytes = response.read()
+                logger.info(f"[Wikidata Collector] Received wbsearchentities response (status {response.status}, {len(resp_bytes)} bytes)")
+                data = json.loads(resp_bytes.decode())
                 
             search_results = data.get('search', [])
             if not search_results:
+                logger.info(f"[Wikidata Collector] No entity search results resolved on Wikidata for '{company_name}'")
                 return {
                     "source": self.config.source_name,
                     "status": "skipped",
@@ -103,6 +124,7 @@ class WikidataCollectorAgent(BaseCollectorAgent):
                 }
                 
             qids = [res['id'] for res in search_results]
+            logger.info(f"[Wikidata Collector] Search matched entity IDs: {qids}")
             
             # 2. Get entity claims
             query2 = urllib.parse.urlencode({
@@ -114,8 +136,12 @@ class WikidataCollectorAgent(BaseCollectorAgent):
             url2 = f'https://www.wikidata.org/w/api.php?{query2}'
             req2 = urllib.request.Request(url2, headers={'User-Agent': self.USER_AGENT})
             
+            logger.info(f"[Wikidata Collector] Requesting entity details for IDs: {qids}")
+            logger.info(f"[Wikidata Collector] Requesting URL: {url2}")
             with urllib.request.urlopen(req2, timeout=10) as response:
-                data2 = json.loads(response.read().decode())
+                resp2_bytes = response.read()
+                logger.info(f"[Wikidata Collector] Received wbgetentities response (status {response.status}, {len(resp2_bytes)} bytes)")
+                data2 = json.loads(resp2_bytes.decode())
                 
             entities = data2.get('entities', {})
             best_qid = None
@@ -140,12 +166,15 @@ class WikidataCollectorAgent(BaseCollectorAgent):
                         break
                         
                 sim = difflib.SequenceMatcher(None, company_name.lower(), label).ratio()
+                logger.info(f"[Wikidata Collector] Evaluating entity {qid_candidate} ({label}): domain_match={domain_match}, name_similarity={sim:.2f}")
                 if domain_match or sim > 0.8:
                     best_qid = qid_candidate
                     best_claims = candidate_claims
+                    logger.info(f"[Wikidata Collector] Selected best entity match: {best_qid} ('{label}')")
                     break
                     
             if not best_qid:
+                logger.info(f"[Wikidata Collector] Could not resolve matching company entity on Wikidata with high confidence (sim > 0.8 or domain match) out of: {qids}")
                 return {
                     "source": self.config.source_name,
                     "status": "skipped",
@@ -182,9 +211,7 @@ class WikidataCollectorAgent(BaseCollectorAgent):
             inception = extract_claim_values('P571')        # inception date
             owned_by = extract_claim_values('P127')         # owned by (parent/acquirer context)
             operating_areas = extract_claim_values('P159')  # areas served via HQ locations
-            # P31 = instance of (e.g. insurance company, mutual company)
             instance_of = extract_claim_values('P31')
-            # P166 = award received / P749 = parent organization
             parent_org = extract_claim_values('P749')
 
             raw_data = {
@@ -200,7 +227,8 @@ class WikidataCollectorAgent(BaseCollectorAgent):
                 "instance_of_ids": instance_of,
                 "operating_area_ids": operating_areas
             }
-
+            
+            logger.info(f"[Wikidata Collector] Fetched raw claims from Wikidata entity '{best_qid}': {json.dumps(raw_data)}")
             
             # Send raw details to LLM to parse and extract requested target fields
             prompt_vars = {
@@ -213,16 +241,19 @@ class WikidataCollectorAgent(BaseCollectorAgent):
             extracted = self.parse_json(response_text)
             
             findings = {k: extracted.get(k) for k in self.config.target_fields}
+            logger.info(f"[Wikidata Collector] Mapped target fields: {findings}")
             return {
                 "source": self.config.source_name,
                 "status": "success",
                 "findings": findings
             }
         except Exception as e:
+            import traceback
+            logger.error(f"[Wikidata Collector] Collection failed: {e}\nTraceback:\n{traceback.format_exc()}")
             return {
                 "source": self.config.source_name,
                 "status": "error",
-                "message": str(e),
+                "message": f"{e}\nTraceback:\n{traceback.format_exc()}",
                 "findings": {}
             }
 
@@ -237,6 +268,7 @@ class SECCollectorAgent(BaseCollectorAgent):
         3. Fallback: company_tickers.json (public/ticker companies only)
         Returns (cik_padded, entity_name) or (None, None) if not found.
         """
+        logger = self.get_logger()
         import re
         import difflib
 
@@ -245,80 +277,98 @@ class SECCollectorAgent(BaseCollectorAgent):
         # --- Tier 1: EDGAR EFTS full-text search (handles private companies) ---
         try:
             search_url = f"https://efts.sec.gov/LATEST/search-index?q={encoded}&forms=10-K&hits.hits.total.value=true"
+            logger.info(f"[SEC CIK Resolve] Tier 1 EFTS search URL: {search_url}")
             req = urllib.request.Request(search_url, headers={'User-Agent': self.USER_AGENT})
             with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
+                resp_bytes = resp.read()
+                logger.info(f"[SEC CIK Resolve] Tier 1 response received ({len(resp_bytes)} bytes)")
+                data = json.loads(resp_bytes.decode())
 
             hits = data.get('hits', {}).get('hits', [])
+            logger.info(f"[SEC CIK Resolve] Tier 1 hits resolved count: {len(hits)}")
             if hits:
-                # Score hits by name similarity, pick best match
                 best_cik = None
                 best_name = None
                 best_score = 0.0
                 for hit in hits[:10]:
                     src = hit.get('_source', {})
                     entity_name = src.get('entity_name', '')
-                    # CIK is the first 10 chars of the accession number (_id)
                     acc_id = hit.get('_id', '')
                     raw_cik = acc_id.split('-')[0] if '-' in acc_id else acc_id[:10]
                     if not raw_cik.isdigit():
                         continue
                     score = difflib.SequenceMatcher(None, company_name.lower(), entity_name.lower()).ratio()
+                    logger.info(f"[SEC CIK Resolve] Tier 1 matching entity '{entity_name}' CIK={raw_cik} Score={score:.2f}")
                     if score > best_score:
                         best_score = score
                         best_cik = raw_cik.zfill(10)
                         best_name = entity_name
                 if best_cik and best_score > 0.4:
+                    logger.info(f"[SEC CIK Resolve] Tier 1 Match Found: CIK={best_cik} Name='{best_name}' (Score={best_score:.2f})")
                     return best_cik, best_name
-        except Exception:
-            pass
+        except Exception as e:
+            import traceback
+            logger.warning(f"[SEC CIK Resolve] Tier 1 EFTS failed: {e}\n{traceback.format_exc()}")
 
         # --- Tier 2: EDGAR company browse API (wider net, parses XML atom feed) ---
         try:
             browse_name = urllib.parse.quote(company_name)
             browse_url = f"https://www.sec.gov/cgi-bin/browse-edgar?company={browse_name}&CIK=&type=10-K&dateb=&owner=include&count=10&search_text=&action=getcompany&output=atom"
+            logger.info(f"[SEC CIK Resolve] Tier 2 browse URL: {browse_url}")
             req2 = urllib.request.Request(browse_url, headers={'User-Agent': self.USER_AGENT})
             with urllib.request.urlopen(req2, timeout=10) as resp2:
                 xml_text = resp2.read().decode()
+                logger.info(f"[SEC CIK Resolve] Tier 2 response size: {len(xml_text)} chars")
 
-            # Extract CIK from atom XML: <company-info><CIK>...</CIK><conformed-name>...</conformed-name>
             cik_matches = re.findall(r'<CIK>(\d+)</CIK>', xml_text)
             name_matches = re.findall(r'<conformed-name>(.*?)</conformed-name>', xml_text, re.IGNORECASE)
+            logger.info(f"[SEC CIK Resolve] Tier 2 resolved CIK matches: {cik_matches}, Name matches: {name_matches}")
             if cik_matches and name_matches:
-                # Pick best name match
                 best_cik = None
                 best_name = None
                 best_score = 0.0
                 for cik_val, nm in zip(cik_matches, name_matches):
                     score = difflib.SequenceMatcher(None, company_name.lower(), nm.lower()).ratio()
+                    logger.info(f"[SEC CIK Resolve] Tier 2 matching candidate '{nm}' CIK={cik_val} Score={score:.2f}")
                     if score > best_score:
                         best_score = score
                         best_cik = str(cik_val).zfill(10)
                         best_name = nm
                 if best_cik and best_score > 0.3:
+                    logger.info(f"[SEC CIK Resolve] Tier 2 Match Found: CIK={best_cik} Name='{best_name}' (Score={best_score:.2f})")
                     return best_cik, best_name
-        except Exception:
-            pass
+        except Exception as e:
+            import traceback
+            logger.warning(f"[SEC CIK Resolve] Tier 2 browse failed: {e}\n{traceback.format_exc()}")
 
         # --- Tier 3: Fallback — company_tickers.json (public/ticker companies) ---
         try:
-            req3 = urllib.request.Request("https://www.sec.gov/files/company_tickers.json", headers={'User-Agent': self.USER_AGENT})
+            tickers_url = "https://www.sec.gov/files/company_tickers.json"
+            logger.info(f"[SEC CIK Resolve] Tier 3 query: {tickers_url}")
+            req3 = urllib.request.Request(tickers_url, headers={'User-Agent': self.USER_AGENT})
             with urllib.request.urlopen(req3, timeout=10) as resp3:
-                tickers = json.loads(resp3.read().decode())
+                tickers_text = resp3.read().decode()
+                tickers = json.loads(tickers_text)
             for _, data in tickers.items():
                 if company_name.lower() in data['title'].lower():
+                    logger.info(f"[SEC CIK Resolve] Tier 3 Match Found (ticker json): CIK={data['cik_str']} Name='{data['title']}'")
                     return str(data['cik_str']).zfill(10), data['title']
-        except Exception:
-            pass
+        except Exception as e:
+            import traceback
+            logger.warning(f"[SEC CIK Resolve] Tier 3 ticker lookup failed: {e}\n{traceback.format_exc()}")
 
+        logger.info(f"[SEC CIK Resolve] CIK lookup failed across all tiers for '{company_name}'")
         return None, None
 
     async def collect(self, company_name: str, domain: str) -> Dict[str, Any]:
+        logger = self.get_logger()
         try:
+            logger.info(f"[SEC EDGAR Collector] Starting data collection for '{company_name}' ({domain})")
             # 1. Resolve Company Name to CIK via multi-tier EDGAR name search
             cik, matched_name = self._resolve_cik(company_name)
 
             if not cik:
+                logger.info(f"[SEC EDGAR Collector] Skipped: CIK could not be resolved for '{company_name}'")
                 return {
                     "source": self.config.source_name,
                     "status": "skipped",
@@ -327,11 +377,16 @@ class SECCollectorAgent(BaseCollectorAgent):
                 }
 
             # 2. Fetch Company Facts
-            req2 = urllib.request.Request(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json", headers={'User-Agent': self.USER_AGENT})
+            facts_url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+            logger.info(f"[SEC EDGAR Collector] Requesting Company Facts URL: {facts_url}")
+            req2 = urllib.request.Request(facts_url, headers={'User-Agent': self.USER_AGENT})
             with urllib.request.urlopen(req2, timeout=10) as response:
-                facts = json.loads(response.read().decode())
+                resp_bytes = response.read()
+                logger.info(f"[SEC EDGAR Collector] Facts API response size: {len(resp_bytes)} bytes")
+                facts = json.loads(resp_bytes.decode())
                 
             gaap = facts.get('facts', {}).get('us-gaap', {})
+            logger.info(f"[SEC EDGAR Collector] Available us-gaap metrics count: {len(gaap)}")
             
             # Find the best revenue key (the one with the latest ending 10-K/annual filing)
             best_key = None
@@ -378,6 +433,8 @@ class SECCollectorAgent(BaseCollectorAgent):
                         best_key = rk
                         best_usd = usd
 
+            logger.info(f"[SEC EDGAR Collector] Best GAAP revenue/premium key matched: '{best_key}' (latest end date: {best_latest_end})")
+
             revenue_val = None
             fiscal_year = None
             quarterly_revenue = []
@@ -403,11 +460,11 @@ class SECCollectorAgent(BaseCollectorAgent):
                 if annual_entries:
                     latest_annual = sorted(annual_entries, key=lambda x: (x.get('end', ''), x.get('filed', '')))[-1]
                     revenue_val = latest_annual['val']
-                    # Use end date's year as the fiscal year if fy is missing or comparative-labeled incorrectly
                     try:
                         fiscal_year = int(latest_annual['end'].split('-')[0])
                     except Exception:
                         fiscal_year = latest_annual.get('fy')
+                    logger.info(f"[SEC EDGAR Collector] Extracted annual revenue: {revenue_val} for fiscal year {fiscal_year}")
 
                 # 2. Extrapolate quarterly revenues (sorted chronologically and deduplicated by end date)
                 if quarterly_entries:
@@ -416,9 +473,9 @@ class SECCollectorAgent(BaseCollectorAgent):
                     for q in sorted_quarters:
                         dedup_quarters[q['end']] = q['val']
                     
-                    # Sort the unique keys chronologically
                     chronological_ends = sorted(dedup_quarters.keys())
                     quarterly_revenue = [dedup_quarters[e] for e in chronological_ends]
+                    logger.info(f"[SEC EDGAR Collector] Extracted quarterly revenues: {quarterly_revenue}")
 
             # Fetch submissions to count subsidiaries if Exhibit 21 is available
             subsidiaries_count = 0
@@ -427,9 +484,13 @@ class SECCollectorAgent(BaseCollectorAgent):
             mdna_text = ""
             segment_text = ""
             try:
-                req_sub = urllib.request.Request(f"https://data.sec.gov/submissions/CIK{cik}.json", headers={'User-Agent': self.USER_AGENT})
+                submissions_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+                logger.info(f"[SEC EDGAR Collector] Requesting submissions URL: {submissions_url}")
+                req_sub = urllib.request.Request(submissions_url, headers={'User-Agent': self.USER_AGENT})
                 with urllib.request.urlopen(req_sub, timeout=10) as res_sub:
-                    sub_data = json.loads(res_sub.read().decode())
+                    resp_sub_bytes = res_sub.read()
+                    logger.info(f"[SEC EDGAR Collector] Submissions response size: {len(resp_sub_bytes)} bytes")
+                    sub_data = json.loads(resp_sub_bytes.decode())
                 
                 filings = sub_data.get('filings', {}).get('recent', {})
                 forms = filings.get('form', [])
@@ -444,6 +505,7 @@ class SECCollectorAgent(BaseCollectorAgent):
                 if acc_no:
                     acc_no_nodashes = acc_no.replace('-', '')
                     index_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_no_nodashes}/index.json"
+                    logger.info(f"[SEC EDGAR Collector] Requesting index directory: {index_url}")
                     req_idx = urllib.request.Request(index_url, headers={'User-Agent': self.USER_AGENT})
                     with urllib.request.urlopen(req_idx, timeout=10) as res_idx:
                         idx = json.loads(res_idx.read().decode())
@@ -460,6 +522,7 @@ class SECCollectorAgent(BaseCollectorAgent):
                             
                     if ex21_file:
                         file_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_no_nodashes}/{ex21_file}"
+                        logger.info(f"[SEC EDGAR Collector] Requesting Exhibit 21 URL: {file_url}")
                         req_file = urllib.request.Request(file_url, headers={'User-Agent': self.USER_AGENT})
                         with urllib.request.urlopen(req_file, timeout=10) as res_file:
                             html = res_file.read().decode('utf-8', errors='ignore')
@@ -467,40 +530,41 @@ class SECCollectorAgent(BaseCollectorAgent):
                         import re
                         rows = re.findall(r'<tr[^>]*>', html, re.IGNORECASE)
                         subsidiaries_count = max(0, len(rows) - 1)
+                        logger.info(f"[SEC EDGAR Collector] Counted {subsidiaries_count} subsidiaries in Exhibit 21.")
 
-                    business_text = ""
-                    risk_text = ""
-                    mdna_text = ""
-                    segment_text = ""
-                    
                     if primary_doc:
                         file_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_no_nodashes}/{primary_doc}"
+                        logger.info(f"[SEC EDGAR Collector] Requesting primary 10-K filing URL: {file_url}")
                         req_file = urllib.request.Request(file_url, headers={'User-Agent': self.USER_AGENT})
                         with urllib.request.urlopen(req_file, timeout=10) as res_file:
                             html_10k = res_file.read().decode('utf-8', errors='ignore')
                             
                         import re
-                        # Strip HTML
                         text_10k = re.sub(r'<[^>]+>', ' ', html_10k)
                         text_10k = re.sub(r'\s+', ' ', text_10k)
                         
-                        # Find Item 1. Business
                         m_bus = re.search(r'(?i)Item\s+1\.\s+Business\b(.*?)(?:Item\s+1A|Item\s+2)', text_10k)
-                        if m_bus: business_text = m_bus.group(1)[:4000]
+                        if m_bus:
+                            business_text = m_bus.group(1)[:4000]
+                            logger.info(f"[SEC EDGAR Collector] Extracted Item 1 Business ({len(business_text)} chars)")
                         
-                        # Find Item 1A. Risk Factors
                         m_risk = re.search(r'(?i)Item\s+1A\.\s+Risk Factors\b(.*?)(?:Item\s+1B|Item\s+2)', text_10k)
-                        if m_risk: risk_text = m_risk.group(1)[:4000]
+                        if m_risk:
+                            risk_text = m_risk.group(1)[:4000]
+                            logger.info(f"[SEC EDGAR Collector] Extracted Item 1A Risk Factors ({len(risk_text)} chars)")
                         
-                        # Find Item 7. MD&A
                         m_mdna = re.search(r'(?i)Item\s+7\.\s+Management\'s Discussion(.*?)(?:Item\s+7A|Item\s+8)', text_10k)
-                        if m_mdna: mdna_text = m_mdna.group(1)[:4000]
+                        if m_mdna:
+                            mdna_text = m_mdna.group(1)[:4000]
+                            logger.info(f"[SEC EDGAR Collector] Extracted Item 7 MD&A ({len(mdna_text)} chars)")
                         
-                        # Find Segment Reporting
                         m_seg = re.search(r'(?i)(?:Segment Reporting|Reportable Segments)(.{0,2000})', text_10k)
-                        if m_seg: segment_text = m_seg.group(1)
-            except Exception:
-                pass
+                        if m_seg:
+                            segment_text = m_seg.group(1)
+                            logger.info(f"[SEC EDGAR Collector] Extracted Segment Reporting indicator text ({len(segment_text)} chars)")
+            except Exception as e:
+                import traceback
+                logger.error(f"[SEC EDGAR Collector] Submissions or 10-K text extraction failed: {e}\n{traceback.format_exc()}")
 
             raw_sec_context = {
                 "cik": cik,
@@ -526,18 +590,20 @@ class SECCollectorAgent(BaseCollectorAgent):
             extracted = self.parse_json(response_text)
             
             findings = {k: extracted.get(k) for k in self.config.target_fields}
-            # Direct override to bypass LLM parsing/truncation errors
             findings["quarterly_revenue"] = quarterly_revenue
+            logger.info(f"[SEC EDGAR Collector] Target mapped findings: {findings}")
             return {
                 "source": self.config.source_name,
                 "status": "success",
                 "findings": findings
             }
         except Exception as e:
+            import traceback
+            logger.error(f"[SEC EDGAR Collector] Collection failed: {e}\n{traceback.format_exc()}")
             return {
                 "source": self.config.source_name,
                 "status": "error",
-                "message": str(e),
+                "message": f"{e}\nTraceback:\n{traceback.format_exc()}",
                 "findings": {}
             }
 
@@ -545,17 +611,21 @@ class DNBCollectorAgent(BaseCollectorAgent):
     USER_AGENT = 'CyberRiskInsurancePOC/1.0 (https://github.com/ShivamModi09/CyberRiskInsurance)'
 
     async def collect(self, company_name: str, domain: str) -> Dict[str, Any]:
-        # Connects to GLEIF API as DNB database resolver
+        logger = self.get_logger()
         query = urllib.parse.quote(company_name)
         url = f"https://api.gleif.org/api/v1/fuzzycompletions?field=entity.legalName&q={query}"
+        logger.info(f"[GLEIF DNB Collector] Resolving legal entity fuzzy completion URL: {url}")
         
         try:
             req = urllib.request.Request(url, headers={'Accept': 'application/json', 'User-Agent': self.USER_AGENT})
             with urllib.request.urlopen(req, timeout=5) as response:
-                data = json.loads(response.read().decode())
+                resp_bytes = response.read()
+                logger.info(f"[GLEIF DNB Collector] Received response size: {len(resp_bytes)} bytes")
+                data = json.loads(resp_bytes.decode())
                 
             if data.get("data") and len(data["data"]) > 0:
                 entity = data["data"][0].get("attributes", {}).get("entity", {})
+                logger.info(f"[GLEIF DNB Collector] Matched GLEIF Entity attributes: {json.dumps(entity)}")
                 
                 # Pass GLEIF raw structure to LLM
                 prompt_vars = {
@@ -568,12 +638,14 @@ class DNBCollectorAgent(BaseCollectorAgent):
                 extracted = self.parse_json(response_text)
                 
                 findings = {k: extracted.get(k) for k in self.config.target_fields}
+                logger.info(f"[GLEIF DNB Collector] Mapped target fields: {findings}")
                 return {
                     "source": self.config.source_name,
                     "status": "success",
                     "findings": findings
                 }
             else:
+                logger.info(f"[GLEIF DNB Collector] No company matches resolved in GLEIF index for query '{company_name}'")
                 return {
                     "source": self.config.source_name,
                     "status": "skipped",
@@ -581,10 +653,12 @@ class DNBCollectorAgent(BaseCollectorAgent):
                     "findings": {}
                 }
         except Exception as e:
+            import traceback
+            logger.error(f"[GLEIF DNB Collector] Collection failed: {e}\n{traceback.format_exc()}")
             return {
                 "source": self.config.source_name,
                 "status": "error",
-                "message": str(e),
+                "message": f"{e}\nTraceback:\n{traceback.format_exc()}",
                 "findings": {}
             }
 
@@ -594,23 +668,31 @@ class DomainScraperCollectorAgent(BaseCollectorAgent):
 
     def _check_ssl(self, host: str) -> bool:
         """Check if the host supports HTTPS via SSL handshake."""
+        logger = self.get_logger()
+        logger.info(f"[Domain Scraper SSL Check] Performing SSL handshake for {host}:443")
         try:
             context = ssl.create_default_context()
             with socket.create_connection((host, 443), timeout=4) as sock:
                 with context.wrap_socket(sock, server_hostname=host) as ssock:
                     ssock.getpeercert()
+                    logger.info(f"[Domain Scraper SSL Check] SSL handshake successful for {host}")
                     return True
-        except Exception:
+        except Exception as e:
+            logger.info(f"[Domain Scraper SSL Check] SSL handshake failed for {host}: {e}")
             return False
 
     def _is_reachable(self, host: str) -> bool:
         """Check if the host is reachable on port 80 or 443."""
+        logger = self.get_logger()
+        logger.info(f"[Domain Scraper Reachability] Probing reachability for {host}")
         for port in (443, 80):
             try:
                 with socket.create_connection((host, port), timeout=4):
+                    logger.info(f"[Domain Scraper Reachability] Host {host} is reachable on port {port}")
                     return True
             except Exception:
                 continue
+        logger.info(f"[Domain Scraper Reachability] Host {host} is unreachable on ports 443 and 80")
         return False
 
     def _crtsh_discover(self, root_domain: str) -> list:
@@ -620,30 +702,33 @@ class DomainScraperCollectorAgent(BaseCollectorAgent):
         Returns a deduplicated list of host strings.
         """
         import re
-        # Strip leading www. to get bare root domain for wildcard query
+        logger = self.get_logger()
         base = re.sub(r'^www\.', '', root_domain)
         query = urllib.parse.quote(f'%.{base}')
         url = self.CRTSH_URL.format(query=query)
+        logger.info(f"[Domain Scraper crt.sh] Querying subdomains for '{root_domain}' using base '{base}'")
+        logger.info(f"[Domain Scraper crt.sh] Requesting URL: {url}")
         discovered = set()
-        # Always include the input domain itself
         discovered.add(root_domain)
 
         try:
             req = urllib.request.Request(url, headers={'User-Agent': self.USER_AGENT})
             with urllib.request.urlopen(req, timeout=10) as response:
-                entries = json.loads(response.read().decode())
+                resp_bytes = response.read()
+                logger.info(f"[Domain Scraper crt.sh] Received crt.sh response ({len(resp_bytes)} bytes)")
+                entries = json.loads(resp_bytes.decode())
             for entry in entries:
                 name = entry.get('name_value', '').strip().lower()
-                # name_value can be newline-separated or contain wildcards
                 for part in name.split('\n'):
                     part = part.strip()
-                    # Skip wildcard entries and entries for different roots
                     if part.startswith('*') or not part.endswith(base):
                         continue
                     if part and re.match(r'^[a-z0-9._-]+$', part):
                         discovered.add(part)
-        except Exception:
-            pass  # crt.sh unavailable — fall back to just the provided domain
+            logger.info(f"[Domain Scraper crt.sh] Discovered deduplicated subdomains: {list(discovered)}")
+        except Exception as e:
+            import traceback
+            logger.warning(f"[Domain Scraper crt.sh] crt.sh query failed: {e}\n{traceback.format_exc()}")
 
         return list(discovered)
 
@@ -652,6 +737,7 @@ class DomainScraperCollectorAgent(BaseCollectorAgent):
         Scrape key pages from a single domain. Returns (text_content, is_reachable).
         """
         import re
+        logger = self.get_logger()
         paths = ["", "/about", "/services", "/solutions", "/products",
                  "/platform", "/business", "/commercial", "/corporate"]
         protocol = "https" if ssl_valid else "http"
@@ -659,12 +745,16 @@ class DomainScraperCollectorAgent(BaseCollectorAgent):
         seen_lines = set()
         reached = False
 
+        logger.info(f"[Domain Scraper Crawl] Crawling domain: {host} (SSL valid: {ssl_valid})")
         for path in paths:
             try:
                 url = f"{protocol}://{host}{path}"
+                logger.info(f"[Domain Scraper Crawl] Requesting page URL: {url}")
                 req = urllib.request.Request(url, headers={'User-Agent': self.USER_AGENT})
                 with urllib.request.urlopen(req, timeout=5) as response:
-                    page_html = response.read().decode('utf-8', errors='ignore')
+                    page_bytes = response.read()
+                    logger.info(f"[Domain Scraper Crawl] Received response for URL {url} ({len(page_bytes)} bytes)")
+                    page_html = page_bytes.decode('utf-8', errors='ignore')
                     reached = True
 
                     text = re.sub(r'<style.*?>.*?</style>', ' ', page_html, flags=re.DOTALL | re.IGNORECASE)
@@ -678,15 +768,16 @@ class DomainScraperCollectorAgent(BaseCollectorAgent):
                         if len(c) > 15 and c not in seen_lines:
                             seen_lines.add(c)
                             merged_text += c + ". "
-            except Exception:
-                pass
+            except Exception as e:
+                logger.info(f"[Domain Scraper Crawl] Crawl failed for page URL {host}{path}: {e}")
 
+        logger.info(f"[Domain Scraper Crawl] Finished crawl for host {host}. Merged text size: {len(merged_text)} chars")
         return merged_text, reached
 
     async def collect(self, company_name: str, domain: str) -> Dict[str, Any]:
-        # Accept all_domains from the agent's state context if available (set by CLI multi-domain input)
-        # The base class passes the full state; fall back to single domain if not available.
+        logger = self.get_logger()
         all_input_domains = getattr(self, '_state_all_domains', [domain])
+        logger.info(f"[Domain Scraper Collector] Starting collection for {company_name}. Input domains: {all_input_domains}")
 
         # 1. For each input root domain, discover subdomains via crt.sh
         all_candidates = []
@@ -704,7 +795,7 @@ class DomainScraperCollectorAgent(BaseCollectorAgent):
 
         for host in all_candidates:
             if not self._is_reachable(host):
-                continue  # skip unreachable hosts silently
+                continue
             ssl_valid = self._check_ssl(host)
             page_text, reached = self._scrape_domain(host, ssl_valid)
 
@@ -718,6 +809,7 @@ class DomainScraperCollectorAgent(BaseCollectorAgent):
 
         # If nothing was reachable at all, fallback to primary domain only
         if not reachable_domains:
+            logger.info(f"[Domain Scraper Collector] No subdomains reachable. Falling back to primary domain: {domain}")
             ssl_primary = self._check_ssl(domain)
             reachable_domains = [{"url": domain, "https_encrypted": ssl_primary}]
 
@@ -743,8 +835,8 @@ class DomainScraperCollectorAgent(BaseCollectorAgent):
             extracted = self.parse_json(response_text)
 
             findings = {k: extracted.get(k) for k in self.config.target_fields}
-            # Hard override: always report the full verified domain list
             findings["domains"] = reachable_domains
+            logger.info(f"[Domain Scraper Collector] Mapped findings: {findings}")
 
             return {
                 "source": self.config.source_name,
@@ -752,10 +844,12 @@ class DomainScraperCollectorAgent(BaseCollectorAgent):
                 "findings": findings
             }
         except Exception as e:
+            import traceback
+            logger.error(f"[Domain Scraper Collector] Collection failed: {e}\n{traceback.format_exc()}")
             return {
                 "source": self.config.source_name,
                 "status": "error",
-                "message": str(e),
+                "message": f"{e}\nTraceback:\n{traceback.format_exc()}",
                 "findings": {
                     "domains": reachable_domains
                 }

@@ -41,6 +41,7 @@ class BaseAgent:
         logger = self.get_logger()
         agent_name = getattr(self.config, 'name', self.__class__.__name__)
         logger.info(f"[{agent_name}] Invoking LLM for prompt/extraction...")
+        logger.info(f"[{agent_name}] Prompt input sent to LLM:\n{prompt}")
 
         # Initialize the live Groq model
         model_name = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
@@ -73,7 +74,8 @@ class BaseAgent:
             
             return str(res.content)
         except Exception as e:
-            logger.error(f"[{agent_name}] LLM invocation failed: {e}")
+            import traceback
+            logger.error(f"[{agent_name}] LLM invocation failed: {e}\nTraceback:\n{traceback.format_exc()}")
             raise RuntimeError(f"Error calling live Groq model: {e}")
 
     def parse_json(self, text: str) -> Dict[str, Any]:

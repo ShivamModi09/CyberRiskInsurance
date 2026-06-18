@@ -275,8 +275,8 @@ async def main_async():
 
     if args.report:
         from reports.report_generator import generate_underwriting_audit_report
-        generate_underwriting_audit_report(final_state, company_name, domain, rule_id)
-        print("\nAudit report generated: reports/underwriting_audit_report.html")
+        report_path = generate_underwriting_audit_report(final_state, company_name, domain, rule_id)
+        print(f"\nAudit report generated: {report_path}")
 
 
 def main():
