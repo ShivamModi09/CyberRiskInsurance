@@ -38,7 +38,10 @@ async def main_async():
 
     rule_id = args.rule.strip()
     company_name = args.company.strip()
-    domain = args.domain.strip()
+    # Support comma-separated multi-domain input
+    raw_domains = [d.strip() for d in args.domain.split(',') if d.strip()]
+    domain = raw_domains[0]  # primary domain (used for entity resolution, cache key, etc.)
+    all_domains = raw_domains  # full list passed into state
 
     if rule_id != "cyber_risk_rating":
         print(f"[ERROR] Rule ID '{rule_id}' is not supported in the active configuration.")
@@ -48,6 +51,8 @@ async def main_async():
     print(f"Rule Target:    {rule_id}")
     print(f"Company Target: {company_name}")
     print(f"Primary Domain: {domain}")
+    if len(all_domains) > 1:
+        print(f"Extra Domains:  {', '.join(all_domains[1:])}")
 
     # Compile the LangGraph workflow
     app = build_cyber_risk_rating_graph(enable_cache=True)
@@ -56,6 +61,7 @@ async def main_async():
     initial_state = {
         "company_name": company_name,
         "domain": domain,
+        "all_domains": all_domains,
         "rule_id": rule_id,
         "valid": False,
         "enrichment": {},

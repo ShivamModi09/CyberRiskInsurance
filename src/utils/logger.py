@@ -51,30 +51,65 @@ def start_run_logging(rule_id: str, company_name: str) -> str:
     
     return run_id
 
-def get_agent_logger(agent_name: str) -> logging.Logger:
-    """Gets a thread-safe, isolated logger for a specific agent/modifier."""
-    run_id = current_run_id.get()
-    
-    # Fallback to standard console logger if logging is not initialized
-    if not run_id:
-        logger = logging.getLogger(f"cyber_risk_insurance.default.{agent_name}")
-        if not logger.handlers:
-            logger.setLevel(logging.INFO)
-            sh = logging.StreamHandler(sys.stdout)
-            sh.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(name)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
-            logger.addHandler(sh)
-        return logger
+class ContextAwareFileHandler(logging.Handler):
+    """
+    A custom file handler that dynamically determines the target log file path
+    based on the active execution context variables, and safely opens and closes
+    the file on every log emit to avoid file descriptor and memory leaks.
+    """
+    def __init__(self, formatter=None):
+        super().__init__()
+        if formatter:
+            self.setFormatter(formatter)
 
-    # Isolated logger per run and agent name
-    logger_name = f"cyber_risk_insurance.{run_id}.{agent_name}"
+    def emit(self, record):
+        run_id = current_run_id.get()
+        if not run_id:
+            return  # No active run context, skip writing to file
+
+        try:
+            log_date = current_log_date.get()
+            log_time = current_log_time.get()
+            company_name = current_company_name.get()
+            
+            # Extract agent/modifier name from logger name
+            # e.g., "cyber_risk_insurance.Wikipedia Collector" -> "Wikipedia Collector"
+            parts = record.name.split(".")
+            agent_name = parts[-1] if len(parts) > 1 else record.name
+            
+            cleaned_name = agent_name.lower()
+            if "collector" in cleaned_name or "scraper" in cleaned_name:
+                folder_slug = "collectors"
+            elif "coordinator" in cleaned_name:
+                folder_slug = "coordinator"
+            elif "factchecker" in cleaned_name or "fact_checker" in cleaned_name or "fact checker" in cleaned_name:
+                folder_slug = "fact_checker"
+            elif "underwriter" in cleaned_name:
+                folder_slug = "underwriter"
+            else:
+                folder_slug = MODIFIER_FOLDER_MAPPING.get(cleaned_name, slugify(agent_name))
+                
+            company_slug = slugify(company_name)
+            
+            log_dir = os.path.join("logs", log_date, folder_slug, company_slug)
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = os.path.join(log_dir, f"run_{log_time}.txt")
+            
+            msg = self.format(record)
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except Exception:
+            self.handleError(record)
+
+def get_agent_logger(agent_name: str) -> logging.Logger:
+    """Gets a static, thread-safe, memory-efficient logger for a specific agent/modifier."""
+    logger_name = f"cyber_risk_insurance.{agent_name}"
     logger = logging.getLogger(logger_name)
     
     if not logger.handlers:
         logger.setLevel(logging.INFO)
         logger.propagate = False
         
-        # Formatter format matching the manager's screenshots:
-        # e.g., 2026-06-12 12:55:43 | INFO | src.collectors | message
         formatter = logging.Formatter(
             '%(asctime)s | %(levelname)s | %(name)s | %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
@@ -85,37 +120,8 @@ def get_agent_logger(agent_name: str) -> logging.Logger:
         sh.setFormatter(formatter)
         logger.addHandler(sh)
         
-        # File Handler
-        log_date = current_log_date.get()
-        log_time = current_log_time.get()
-        company_name = current_company_name.get()
+        # Context-aware dynamic file handler
+        cfh = ContextAwareFileHandler(formatter)
+        logger.addHandler(cfh)
         
-        # Slugify folders
-        cleaned_name = agent_name.lower()
-        if "collector" in cleaned_name or "scraper" in cleaned_name:
-            folder_slug = "collectors"
-        elif "coordinator" in cleaned_name:
-            folder_slug = "coordinator"
-        elif "factchecker" in cleaned_name or "fact_checker" in cleaned_name or "fact checker" in cleaned_name:
-            folder_slug = "fact_checker"
-        elif "underwriter" in cleaned_name:
-            folder_slug = "underwriter"
-        else:
-            folder_slug = MODIFIER_FOLDER_MAPPING.get(cleaned_name, slugify(agent_name))
-            
-        company_slug = slugify(company_name)
-        
-        log_dir = os.path.join("logs", log_date, folder_slug, company_slug)
-        try:
-            os.makedirs(log_dir, exist_ok=True)
-            log_file = os.path.join(log_dir, f"run_{log_time}.log")
-            
-            fh = logging.FileHandler(log_file, encoding='utf-8')
-            fh.setFormatter(formatter)
-            logger.addHandler(fh)
-        except Exception as e:
-            # Fallback if file logging directory creation fails
-            sh.stream.write(f"[WARNING] Failed to configure file logging for {agent_name}: {e}\n")
-            
     return logger
-

@@ -76,23 +76,47 @@ class CollectionCoordinatorAgent(BaseCoordinatorAgent):
                 merged["revenue"] = val
                 break
 
-        # Subsidiaries Priority
+        # Subsidiaries Priority — check both 'subsidiaries' and SEC-specific 'subsidiaries_list'
         for src in sources_order:
+            val = get_val(src, "subsidiaries_list")  # SEC returns this as a named list
+            if val and isinstance(val, list) and len(val) > 0:
+                merged["subsidiaries"] = val
+                break
             val = get_val(src, "subsidiaries")
-            if val:
+            if val and isinstance(val, list) and len(val) > 0:
                 merged["subsidiaries"] = val
                 break
             val_count = get_val(src, "subsidiaries_count")
-            if val_count is not None:
-                merged["subsidiaries"] = ["Exhibit 21 Subsidiary"] * val_count
+            if val_count is not None and int(val_count) > 0:
+                merged["subsidiaries"] = ["Exhibit 21 Subsidiary"] * int(val_count)
                 break
 
-        # Acquisitions Priority
+
+        # Acquisitions Priority — merge from all sources to maximize coverage
+        all_acquisitions = []
+        seen_acq_names = set()
         for src in sources_order:
             val = get_val(src, "acquisitions")
-            if val:
-                merged["acquisitions"] = val
-                break
+            if val and isinstance(val, list):
+                for acq in val:
+                    name = str(acq.get("name", acq) if isinstance(acq, dict) else acq).lower().strip()
+                    if name and name not in seen_acq_names:
+                        seen_acq_names.add(name)
+                        all_acquisitions.append(acq)
+            # Also check acquisitions_mentions (SEC format — list of strings)
+            mentions = get_val(src, "acquisitions_mentions")
+            if mentions and isinstance(mentions, list):
+                for m in mentions:
+                    name = str(m).lower().strip()
+                    if name and name not in seen_acq_names:
+                        seen_acq_names.add(name)
+                        all_acquisitions.append({
+                            "name": m,
+                            "deal_type": "minor acquisition",
+                            "recency_years": 5.0
+                        })
+        if all_acquisitions:
+            merged["acquisitions"] = all_acquisitions
 
         # Customer Type / Ecommerce / Countries
         for src in sources_order:
@@ -105,11 +129,20 @@ class CollectionCoordinatorAgent(BaseCoordinatorAgent):
             if val is not None:
                 merged["has_ecommerce"] = val
                 break
+        # Countries of operation — aggregate from all sources for full global coverage
+        all_countries = []
+        seen_countries = set()
         for src in sources_order:
             val = get_val(src, "countries_of_operation")
-            if val:
-                merged["countries_of_operation"] = val
-                break
+            if val and isinstance(val, list):
+                for c in val:
+                    c_norm = str(c).strip()
+                    if c_norm and c_norm.lower() not in seen_countries:
+                        seen_countries.add(c_norm.lower())
+                        all_countries.append(c_norm)
+        if all_countries:
+            merged["countries_of_operation"] = all_countries
+
         for src in sources_order:
             val = get_val(src, "privacy_policy_published")
             if val is not None:
@@ -151,12 +184,71 @@ class CollectionCoordinatorAgent(BaseCoordinatorAgent):
                 merged["founding_year"] = val
                 break
 
-        # Domains / HTTPS
+        # Domains / HTTPS — first take what DomainScraper found
         for src in sources_order:
             val = get_val(src, "domains")
             if val:
                 merged["domains"] = val
                 break
+
+        # Coordinator Supplemental Domain Scrape:
+        # Extract official_websites from any collector, find new root domains not already
+        # covered by DomainScraper, run crt.sh on them, scrape, and merge into domain findings.
+        try:
+            import re
+            import socket
+            import ssl as ssl_lib
+
+            already_covered = {d["url"].lower() for d in merged.get("domains", [])}
+
+            # Collect official_websites from all sources
+            extra_urls = []
+            for src in sources_order:
+                urls = get_val(src, "official_websites") or []
+                if isinstance(urls, list):
+                    extra_urls.extend(urls)
+                single = get_val(src, "official_website")
+                if single and isinstance(single, str):
+                    extra_urls.append(single)
+
+            # Extract hostnames from URLs
+            new_roots = []
+            seen_roots = set()
+            for url in extra_urls:
+                try:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(url if url.startswith("http") else f"https://{url}")
+                    host = parsed.hostname or ""
+                    host = re.sub(r'^www\.', '', host.lower())
+                    if host and host not in seen_roots:
+                        # Check if this root is not already covered
+                        already = any(host in covered for covered in already_covered)
+                        if not already:
+                            seen_roots.add(host)
+                            new_roots.append(host)
+                except Exception:
+                    pass
+
+            if new_roots:
+                # Import DomainScraperCollectorAgent for crt.sh + scrape reuse
+                from src.collectors import DomainScraperCollectorAgent
+                _scraper = DomainScraperCollectorAgent.__new__(DomainScraperCollectorAgent)
+
+                for root in new_roots:
+                    discovered = _scraper._crtsh_discover(root)
+                    for host in discovered:
+                        if host.lower() in already_covered:
+                            continue
+                        if not _scraper._is_reachable(host):
+                            continue
+                        ssl_valid = _scraper._check_ssl(host)
+                        page_text, reached = _scraper._scrape_domain(host, ssl_valid)
+                        if reached:
+                            merged["domains"].append({"url": host, "https_encrypted": ssl_valid})
+                            already_covered.add(host.lower())
+                            logger.info(f"[Coordinator Supplemental Scrape] Added new domain: {host} (HTTPS: {ssl_valid})")
+        except Exception as e:
+            logger.warning(f"[Coordinator Supplemental Scrape] Failed: {e}")
 
         # Call LLM to reconcile profile and write rationale
         prompt_vars = {
@@ -573,7 +665,9 @@ class UnderwriterAgent(BaseUnderwriterAgent):
                 if cv < 0.1: season_rating = "favourable"
                 elif cv <= 0.25: season_rating = "average"
                 else: season_rating = "partially unfavourable"
-            underwriting_rationale["Seasonality of sales"] = f"Sales CV: {cv:.3f} calculated from quarterly revenues."
+                underwriting_rationale["Seasonality of sales"] = f"Sales CV: {cv:.3f} calculated from quarterly revenues."
+            else:
+                underwriting_rationale["Seasonality of sales"] = "Zero mean quarterly revenue, fallback to average seasonality."
         else:
             if sic == "5311":
                 season_rating = "partially unfavourable"

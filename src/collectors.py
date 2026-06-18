@@ -29,15 +29,17 @@ class WikipediaCollectorAgent(BaseCollectorAgent):
                 }
                 
             title = urllib.parse.quote(search_results[0]["title"])
-            summary_url = f"https://en.wikipedia.org/w/api.php?action=query&prop=extracts&exintro&titles={title}&format=json"
+            # Fetch full article (no exintro) with plain text to capture acquisitions, global ops, etc.
+            summary_url = f"https://en.wikipedia.org/w/api.php?action=query&prop=extracts&explaintext=&titles={title}&format=json"
             
             req2 = urllib.request.Request(summary_url, headers={'User-Agent': self.USER_AGENT})
-            with urllib.request.urlopen(req2, timeout=5) as response2:
+            with urllib.request.urlopen(req2, timeout=10) as response2:
                 summary_data = json.loads(response2.read().decode())
             
             pages = summary_data.get("query", {}).get("pages", {})
             page = list(pages.values())[0] if pages else {}
-            extract = page.get("extract", "")
+            # Cap at 12000 chars to keep LLM prompt within safe token limits
+            extract = page.get("extract", "")[:12000]
             
             if not extract:
                 return {
@@ -172,13 +174,19 @@ class WikidataCollectorAgent(BaseCollectorAgent):
                 return vals
 
             # Get some raw values for claims to present to LLM
-            countries = extract_claim_values('P17')
-            hqs = extract_claim_values('P159')
-            industries = extract_claim_values('P452')
-            websites = extract_claim_values('P856')
-            subsidiaries = extract_claim_values('P355')
-            inception = extract_claim_values('P571')
-            
+            countries = extract_claim_values('P17')         # country
+            hqs = extract_claim_values('P159')              # headquarters location
+            industries = extract_claim_values('P452')       # industry
+            websites = extract_claim_values('P856')         # official website(s)
+            subsidiaries = extract_claim_values('P355')     # subsidiaries
+            inception = extract_claim_values('P571')        # inception date
+            owned_by = extract_claim_values('P127')         # owned by (parent/acquirer context)
+            operating_areas = extract_claim_values('P159')  # areas served via HQ locations
+            # P31 = instance of (e.g. insurance company, mutual company)
+            instance_of = extract_claim_values('P31')
+            # P166 = award received / P749 = parent organization
+            parent_org = extract_claim_values('P749')
+
             raw_data = {
                 "qid": best_qid,
                 "countries_ids": countries,
@@ -186,8 +194,13 @@ class WikidataCollectorAgent(BaseCollectorAgent):
                 "industry_ids": industries,
                 "websites": websites,
                 "subsidiaries_ids": subsidiaries,
-                "inception": inception
+                "inception": inception,
+                "owned_by_ids": owned_by,
+                "parent_org_ids": parent_org,
+                "instance_of_ids": instance_of,
+                "operating_area_ids": operating_areas
             }
+
             
             # Send raw details to LLM to parse and extract requested target fields
             prompt_vars = {
@@ -216,27 +229,103 @@ class WikidataCollectorAgent(BaseCollectorAgent):
 class SECCollectorAgent(BaseCollectorAgent):
     USER_AGENT = 'CyberRiskAgent/1.0 (contact@example.com)'
 
+    def _resolve_cik(self, company_name: str) -> tuple:
+        """
+        Resolve company name to (cik_str, matched_entity_name) using a 3-tier strategy:
+        1. EDGAR full-text search API (efts.sec.gov) — works for private/mutual companies
+        2. EDGAR company browse API (HTML-based, broader coverage)
+        3. Fallback: company_tickers.json (public/ticker companies only)
+        Returns (cik_padded, entity_name) or (None, None) if not found.
+        """
+        import re
+        import difflib
+
+        encoded = urllib.parse.quote(f'"{company_name}"')
+
+        # --- Tier 1: EDGAR EFTS full-text search (handles private companies) ---
+        try:
+            search_url = f"https://efts.sec.gov/LATEST/search-index?q={encoded}&forms=10-K&hits.hits.total.value=true"
+            req = urllib.request.Request(search_url, headers={'User-Agent': self.USER_AGENT})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+
+            hits = data.get('hits', {}).get('hits', [])
+            if hits:
+                # Score hits by name similarity, pick best match
+                best_cik = None
+                best_name = None
+                best_score = 0.0
+                for hit in hits[:10]:
+                    src = hit.get('_source', {})
+                    entity_name = src.get('entity_name', '')
+                    # CIK is the first 10 chars of the accession number (_id)
+                    acc_id = hit.get('_id', '')
+                    raw_cik = acc_id.split('-')[0] if '-' in acc_id else acc_id[:10]
+                    if not raw_cik.isdigit():
+                        continue
+                    score = difflib.SequenceMatcher(None, company_name.lower(), entity_name.lower()).ratio()
+                    if score > best_score:
+                        best_score = score
+                        best_cik = raw_cik.zfill(10)
+                        best_name = entity_name
+                if best_cik and best_score > 0.4:
+                    return best_cik, best_name
+        except Exception:
+            pass
+
+        # --- Tier 2: EDGAR company browse API (wider net, parses XML atom feed) ---
+        try:
+            browse_name = urllib.parse.quote(company_name)
+            browse_url = f"https://www.sec.gov/cgi-bin/browse-edgar?company={browse_name}&CIK=&type=10-K&dateb=&owner=include&count=10&search_text=&action=getcompany&output=atom"
+            req2 = urllib.request.Request(browse_url, headers={'User-Agent': self.USER_AGENT})
+            with urllib.request.urlopen(req2, timeout=10) as resp2:
+                xml_text = resp2.read().decode()
+
+            # Extract CIK from atom XML: <company-info><CIK>...</CIK><conformed-name>...</conformed-name>
+            cik_matches = re.findall(r'<CIK>(\d+)</CIK>', xml_text)
+            name_matches = re.findall(r'<conformed-name>(.*?)</conformed-name>', xml_text, re.IGNORECASE)
+            if cik_matches and name_matches:
+                # Pick best name match
+                best_cik = None
+                best_name = None
+                best_score = 0.0
+                for cik_val, nm in zip(cik_matches, name_matches):
+                    score = difflib.SequenceMatcher(None, company_name.lower(), nm.lower()).ratio()
+                    if score > best_score:
+                        best_score = score
+                        best_cik = str(cik_val).zfill(10)
+                        best_name = nm
+                if best_cik and best_score > 0.3:
+                    return best_cik, best_name
+        except Exception:
+            pass
+
+        # --- Tier 3: Fallback — company_tickers.json (public/ticker companies) ---
+        try:
+            req3 = urllib.request.Request("https://www.sec.gov/files/company_tickers.json", headers={'User-Agent': self.USER_AGENT})
+            with urllib.request.urlopen(req3, timeout=10) as resp3:
+                tickers = json.loads(resp3.read().decode())
+            for _, data in tickers.items():
+                if company_name.lower() in data['title'].lower():
+                    return str(data['cik_str']).zfill(10), data['title']
+        except Exception:
+            pass
+
+        return None, None
+
     async def collect(self, company_name: str, domain: str) -> Dict[str, Any]:
         try:
-            # 1. Resolve Company Name to CIK
-            req = urllib.request.Request("https://www.sec.gov/files/company_tickers.json", headers={'User-Agent': self.USER_AGENT})
-            with urllib.request.urlopen(req, timeout=10) as response:
-                tickers = json.loads(response.read().decode())
-                
-            cik = None
-            for key, data in tickers.items():
-                if company_name.lower() in data['title'].lower():
-                    cik = str(data['cik_str']).zfill(10)
-                    break
-                    
+            # 1. Resolve Company Name to CIK via multi-tier EDGAR name search
+            cik, matched_name = self._resolve_cik(company_name)
+
             if not cik:
                 return {
                     "source": self.config.source_name,
                     "status": "skipped",
-                    "message": "Company not found in SEC EDGAR tickers.",
+                    "message": f"Company '{company_name}' not found in SEC EDGAR (tried EFTS search, browse API, and tickers list).",
                     "findings": {}
                 }
-                
+
             # 2. Fetch Company Facts
             req2 = urllib.request.Request(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json", headers={'User-Agent': self.USER_AGENT})
             with urllib.request.urlopen(req2, timeout=10) as response:
@@ -251,7 +340,22 @@ class SECCollectorAgent(BaseCollectorAgent):
             
             from datetime import datetime
 
-            for rk in ['RevenueFromContractWithCustomerExcludingAssessedTax', 'Revenues', 'SalesRevenueNet']:
+            for rk in [
+                # Standard commercial/tech
+                'RevenueFromContractWithCustomerExcludingAssessedTax',
+                'Revenues',
+                'SalesRevenueNet',
+                # Insurance-specific (Liberty Mutual, Travelers, etc.)
+                'PremiumsEarned',
+                'PremiumsWrittenNet',
+                'NetPremiumsEarned',
+                'InsurancePremiumsAndOtherRevenues',
+                'PolicyholderBenefitsAndClaimsIncurredNet',
+                # Financial services
+                'InterestAndDividendIncomeOperating',
+                'RevenuesExcludingInterestAndDividends',
+                'NetIncomeLoss',
+            ]:
                 if rk in gaap:
                     units = gaap[rk].get('units', {})
                     usd = units.get('USD', [])
@@ -400,6 +504,7 @@ class SECCollectorAgent(BaseCollectorAgent):
 
             raw_sec_context = {
                 "cik": cik,
+                "matched_entity_name": matched_name,
                 "raw_annual_revenue": revenue_val,
                 "fiscal_year": fiscal_year,
                 "exhibit21_subsidiaries_count": subsidiaries_count,
@@ -484,37 +589,89 @@ class DNBCollectorAgent(BaseCollectorAgent):
             }
 
 class DomainScraperCollectorAgent(BaseCollectorAgent):
-    async def collect(self, company_name: str, domain: str) -> Dict[str, Any]:
-        ssl_valid = False
+    USER_AGENT = 'CyberRiskInsurancePOC/1.0 (https://github.com/ShivamModi09/CyberRiskInsurance)'
+    CRTSH_URL = 'https://crt.sh/?q={query}&output=json'
+
+    def _check_ssl(self, host: str) -> bool:
+        """Check if the host supports HTTPS via SSL handshake."""
         try:
             context = ssl.create_default_context()
-            with socket.create_connection((domain, 443), timeout=5) as sock:
-                with context.wrap_socket(sock, server_hostname=domain) as ssock:
-                    cert = ssock.getpeercert()
-                    ssl_valid = True
+            with socket.create_connection((host, 443), timeout=4) as sock:
+                with context.wrap_socket(sock, server_hostname=host) as ssock:
+                    ssock.getpeercert()
+                    return True
         except Exception:
-            ssl_valid = False
-            
-        html_content = ""
+            return False
+
+    def _is_reachable(self, host: str) -> bool:
+        """Check if the host is reachable on port 80 or 443."""
+        for port in (443, 80):
+            try:
+                with socket.create_connection((host, port), timeout=4):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _crtsh_discover(self, root_domain: str) -> list:
+        """
+        Query crt.sh Certificate Transparency logs to discover all real subdomains
+        that have ever had an SSL certificate issued for this root domain.
+        Returns a deduplicated list of host strings.
+        """
         import re
-        
-        paths = ["", "/about", "/services", "/solutions", "/products", "/platform"]
+        # Strip leading www. to get bare root domain for wildcard query
+        base = re.sub(r'^www\.', '', root_domain)
+        query = urllib.parse.quote(f'%.{base}')
+        url = self.CRTSH_URL.format(query=query)
+        discovered = set()
+        # Always include the input domain itself
+        discovered.add(root_domain)
+
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': self.USER_AGENT})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                entries = json.loads(response.read().decode())
+            for entry in entries:
+                name = entry.get('name_value', '').strip().lower()
+                # name_value can be newline-separated or contain wildcards
+                for part in name.split('\n'):
+                    part = part.strip()
+                    # Skip wildcard entries and entries for different roots
+                    if part.startswith('*') or not part.endswith(base):
+                        continue
+                    if part and re.match(r'^[a-z0-9._-]+$', part):
+                        discovered.add(part)
+        except Exception:
+            pass  # crt.sh unavailable — fall back to just the provided domain
+
+        return list(discovered)
+
+    def _scrape_domain(self, host: str, ssl_valid: bool) -> tuple:
+        """
+        Scrape key pages from a single domain. Returns (text_content, is_reachable).
+        """
+        import re
+        paths = ["", "/about", "/services", "/solutions", "/products",
+                 "/platform", "/business", "/commercial", "/corporate"]
         protocol = "https" if ssl_valid else "http"
         merged_text = ""
         seen_lines = set()
-        
+        reached = False
+
         for path in paths:
             try:
-                url = f"{protocol}://{domain}{path}"
-                req = urllib.request.Request(url, headers={'User-Agent': 'CyberRiskInsurancePOC/1.0'})
+                url = f"{protocol}://{host}{path}"
+                req = urllib.request.Request(url, headers={'User-Agent': self.USER_AGENT})
                 with urllib.request.urlopen(req, timeout=5) as response:
                     page_html = response.read().decode('utf-8', errors='ignore')
-                    
+                    reached = True
+
                     text = re.sub(r'<style.*?>.*?</style>', ' ', page_html, flags=re.DOTALL | re.IGNORECASE)
                     text = re.sub(r'<script.*?>.*?</script>', ' ', text, flags=re.DOTALL | re.IGNORECASE)
                     text = re.sub(r'<[^>]+>', ' ', text)
                     text = re.sub(r'\s+', ' ', text)
-                    
+
                     chunks = text.split('.')
                     for c in chunks:
                         c = c.strip()
@@ -523,17 +680,59 @@ class DomainScraperCollectorAgent(BaseCollectorAgent):
                             merged_text += c + ". "
             except Exception:
                 pass
-                
-        merged_text = merged_text[:12000]
+
+        return merged_text, reached
+
+    async def collect(self, company_name: str, domain: str) -> Dict[str, Any]:
+        # Accept all_domains from the agent's state context if available (set by CLI multi-domain input)
+        # The base class passes the full state; fall back to single domain if not available.
+        all_input_domains = getattr(self, '_state_all_domains', [domain])
+
+        # 1. For each input root domain, discover subdomains via crt.sh
+        all_candidates = []
+        seen_candidates = set()
+        for root in all_input_domains:
+            for host in self._crtsh_discover(root):
+                if host not in seen_candidates:
+                    seen_candidates.add(host)
+                    all_candidates.append(host)
+
+        # 2. Probe each candidate — check reachability and SSL
+        reachable_domains = []
+        all_merged_text = ""
+        seen_text_lines: set = set()
+
+        for host in all_candidates:
+            if not self._is_reachable(host):
+                continue  # skip unreachable hosts silently
+            ssl_valid = self._check_ssl(host)
+            page_text, reached = self._scrape_domain(host, ssl_valid)
+
+            if reached:
+                reachable_domains.append({"url": host, "https_encrypted": ssl_valid})
+                for chunk in page_text.split(". "):
+                    chunk = chunk.strip()
+                    if len(chunk) > 15 and chunk not in seen_text_lines:
+                        seen_text_lines.add(chunk)
+                        all_merged_text += chunk + ". "
+
+        # If nothing was reachable at all, fallback to primary domain only
+        if not reachable_domains:
+            ssl_primary = self._check_ssl(domain)
+            reachable_domains = [{"url": domain, "https_encrypted": ssl_primary}]
+
+        # Cap merged text for LLM
+        all_merged_text = all_merged_text[:14000]
 
         raw_context = {
-            "url": domain,
-            "https_encrypted": ssl_valid,
-            "homepage_html_snippet": merged_text
+            "primary_domain": domain,
+            "all_input_domains": all_input_domains,
+            "discovered_domains": reachable_domains,
+            "https_encrypted": any(d["https_encrypted"] for d in reachable_domains),
+            "homepage_html_snippet": all_merged_text
         }
-        
+
         try:
-            # Call LLM to format findings cleanly
             prompt_vars = {
                 "company_name": company_name,
                 "domain": domain,
@@ -542,14 +741,11 @@ class DomainScraperCollectorAgent(BaseCollectorAgent):
             prompt = self.format_prompt(self.config.prompt_template, **prompt_vars)
             response_text = self.call_llm(prompt)
             extracted = self.parse_json(response_text)
-            
+
             findings = {k: extracted.get(k) for k in self.config.target_fields}
-            # Hard override if connection failed to ensure accuracy
-            if not ssl_valid and "domains" in findings:
-                findings["domains"] = [{"url": domain, "https_encrypted": False}]
-            elif ssl_valid and "domains" in findings:
-                findings["domains"] = [{"url": domain, "https_encrypted": True}]
-                
+            # Hard override: always report the full verified domain list
+            findings["domains"] = reachable_domains
+
             return {
                 "source": self.config.source_name,
                 "status": "success",
@@ -561,9 +757,10 @@ class DomainScraperCollectorAgent(BaseCollectorAgent):
                 "status": "error",
                 "message": str(e),
                 "findings": {
-                    "domains": [{"url": domain, "https_encrypted": ssl_valid}]
+                    "domains": reachable_domains
                 }
             }
+
 
 class ResponsesAPICollectorAgent(BaseCollectorAgent):
     async def collect(self, company_name: str, domain: str) -> Dict[str, Any]:

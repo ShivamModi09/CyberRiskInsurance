@@ -20,13 +20,18 @@ Wikipedia Text:
 
 {format_instructions}
 Your output JSON must contain:
-- "subsidiaries": list of string names of subsidiaries mentioned.
-- "acquisitions": list of objects representing acquisitions made, each with "deal_type" (string, e.g. "minor acquisition", "material acquisition", "transitional acquisition") and "recency_years" (number, float). Use an empty list if none are mentioned.
+- "subsidiaries": list of string names of ALL subsidiaries mentioned anywhere in the text.
+- "acquisitions": list of objects for EVERY acquisition or company purchase mentioned in the text. Each object must have:
+  - "name": string name of acquired company.
+  - "deal_type": string - classify as "minor acquisition", "material acquisition", or "transitional acquisition" based on context.
+  - "recency_years": float - the year of the acquisition (e.g. 2021.0), or estimate from context. Use the actual year mentioned, not years-ago.
+  Do NOT return an empty list if acquisitions are mentioned anywhere in the text. Look carefully through ALL sections.
+- "countries_of_operation": list of ALL country name strings where the company operates globally (e.g. ["United States", "United Kingdom", "Germany"]). Do NOT limit to only the primary country.
 - "customer_type": "B2B" or "B2C" or "MIX" or null.
 - "has_ecommerce": boolean or null (whether they sell products/services online directly via digital checkout).
-- "country": string name of the primary country mentioned (e.g. USA, India).
-- "founding_year": numerical year when the company was founded (e.g. 1998), or null if not found.
-- "industry_classification": list of strings (primary industry and business model keywords).
+- "country": string name of the primary headquarters country.
+- "founding_year": numerical year when the company was founded (e.g. 1912), or null if not found.
+- "industry_classification": list of strings covering primary industry AND all sub-industries mentioned (e.g. ["Insurance", "Property and Casualty", "Life Insurance", "Commercial Insurance"]).
 """,
     required_vars=["company_name", "domain", "wikipedia_text"]
 )
@@ -35,13 +40,17 @@ WIKIPEDIA = CollectorAgentConfig(
     name="Wikipedia Collector",
     agent_type="wikipedia",
     prompt_template=WIKIPEDIA_PROMPT,
-    target_fields=["subsidiaries", "acquisitions", "customer_type", "has_ecommerce", "country", "founding_year", "industry_classification"],
+    target_fields=[
+        "subsidiaries", "acquisitions", "customer_type", "has_ecommerce",
+        "country", "countries_of_operation", "founding_year", "industry_classification"
+    ],
     source_name="Wikipedia"
 )
 
 WIKIDATA_PROMPT = PromptTemplate(
     template="""You are an expert underwriter extraction agent.
 Analyze the following raw Wikidata claims JSON for {company_name} ({domain}) and extract key details.
+Note: IDs like Q12345 are Wikidata entity identifiers representing real-world entities (countries, companies, industries).
 Wikidata Context:
 {wikidata_text}
 
@@ -49,13 +58,18 @@ Wikidata Context:
 Your output JSON must contain:
 - "revenue": numerical value of revenue or null if not found.
 - "employees": numerical value of employee count or null.
-- "country": string name of primary country.
-- "headquarters": string name of headquarters city.
-- "industry": list of strings for primary industry sectors.
-- "sub_industries": list of strings for sub-industries and business model keywords.
-- "official_website": string URL.
-- "subsidiaries": list of string names of subsidiaries.
-- "founding_year": numerical year when the company was founded (extracted from inception property), or null if not found.
+- "country": string name of the primary headquarters country (infer from headquarters_ids or countries_ids).
+- "headquarters": string name of the headquarters city.
+- "industry": list of strings for ALL primary industry sectors mentioned (resolve Q IDs to industry names where you can).
+- "sub_industries": list of strings for ALL sub-industries and business model keywords (e.g. Property insurance, Casualty insurance, Life insurance, Commercial insurance).
+- "official_website": string primary URL from the websites list.
+- "official_websites": list of ALL URLs found in the websites list (captures multiple domains like business.libertymutual.com, www.libertymutualgroup.com).
+- "subsidiaries": list of string names of subsidiaries from subsidiaries_ids (use general knowledge to resolve Wikidata Q IDs to company names).
+- "countries_of_operation": list of ALL country strings where the company operates globally. Use operating_area_ids, headquarters_ids, and your knowledge of the company to populate this — do NOT limit to one country.
+- "parent_organization": string name of the parent or holding company if present in parent_org_ids, or null.
+- "company_type": string describing the legal form (e.g. mutual company, public company, private company) inferred from instance_of_ids.
+- "founding_year": numerical year when the company was founded (extracted from inception field), or null if not found.
+- "acquisitions": list of acquisition objects. Use owned_by_ids and subsidiaries_ids and your general knowledge to infer known acquisitions. Each object: {{"name": string, "deal_type": string, "recency_years": float}}. Return empty list only if truly no acquisitions are known.
 """,
     required_vars=["company_name", "domain", "wikidata_text"]
 )
@@ -64,31 +78,40 @@ WIKIDATA = CollectorAgentConfig(
     name="Wikidata Collector",
     agent_type="wikidata",
     prompt_template=WIKIDATA_PROMPT,
-    target_fields=["revenue", "employees", "country", "headquarters", "industry", "sub_industries", "official_website", "subsidiaries", "founding_year"],
+    target_fields=[
+        "revenue", "employees", "country", "headquarters", "industry", "sub_industries",
+        "official_website", "official_websites", "subsidiaries", "founding_year",
+        "countries_of_operation", "parent_organization", "company_type", "acquisitions"
+    ],
     source_name="Wikidata"
 )
 
 SEC_PROMPT = PromptTemplate(
     template="""You are an expert underwriter extraction agent.
 Analyze the following SEC EDGAR facts and submission data for {company_name} ({domain}) and extract findings.
+Note: matched_entity_name is the actual SEC-registered entity name found (may differ from the input company name).
+For insurance companies, revenue may be reported as PremiumsEarned or similar — use raw_annual_revenue directly if present.
 SEC Context:
 {sec_text}
 
 {format_instructions}
 Your output JSON must contain:
-- "revenue": numerical annual revenue or null.
+- "revenue": numerical annual revenue in USD (use raw_annual_revenue if present, else null). For insurance companies this is total premiums earned.
 - "fiscal_year": numerical year of the latest 10-K (e.g., 2024).
-- "business_segments": list of strings (operating segments mentioned).
-- "geographic_revenue_or_regions": list of strings.
+- "business_segments": list of strings (operating segments mentioned, e.g. Personal Lines, Commercial Lines, Global Risk Solutions).
+- "geographic_revenue_or_regions": list of strings (geographic regions mentioned in filings).
 - "subsidiaries_count": numerical count of exhibit 21 subsidiaries.
 - "subsidiaries_list": list of strings representing subsidiary names, if available.
-- "acquisitions_mentions": list of strings representing recent acquisitions mentioned.
+- "acquisitions_mentions": list of strings representing recent acquisitions or M&A transactions explicitly mentioned in business or MD&A sections.
+- "acquisitions": list of objects for acquisitions, each with "name" (string), "deal_type" (string: minor/material/transitional acquisition), "recency_years" (float year).
 - "risk_factor_keywords": list of strings (e.g., cybersecurity, data privacy, service disruption).
 - "cybersecurity_mentions": boolean (whether cybersecurity is explicitly mentioned as a risk or initiative).
 - "cloud_technology_mentions": boolean (whether cloud technology/services are mentioned).
 - "customer_data_mentions": boolean (whether handling customer data or PII is mentioned).
 - "filing_url": string URL to the latest annual report or 10-K filing.
 - "quarterly_revenue": list of numerical quarterly revenues or empty list.
+- "sic_codes": list of strings (SIC codes for the company's industry, e.g. ["6311"] for life insurance, ["6331"] for fire/marine/casualty insurance).
+- "company_type": string describing company legal form (e.g. mutual holding company, stock corporation).
 """,
     required_vars=["company_name", "domain", "sec_text"]
 )
@@ -99,12 +122,13 @@ SEC = CollectorAgentConfig(
     prompt_template=SEC_PROMPT,
     target_fields=[
         "revenue", "fiscal_year", "business_segments", "geographic_revenue_or_regions",
-        "subsidiaries_count", "subsidiaries_list", "acquisitions_mentions", "risk_factor_keywords",
-        "cybersecurity_mentions", "cloud_technology_mentions", "customer_data_mentions", "filing_url",
-        "quarterly_revenue"
+        "subsidiaries_count", "subsidiaries_list", "acquisitions_mentions", "acquisitions",
+        "risk_factor_keywords", "cybersecurity_mentions", "cloud_technology_mentions",
+        "customer_data_mentions", "filing_url", "quarterly_revenue", "sic_codes", "company_type"
     ],
     source_name="SECCollector"
 )
+
 
 DNB_PROMPT = PromptTemplate(
     template="""You are an expert underwriter extraction agent.
@@ -135,19 +159,19 @@ DNB = CollectorAgentConfig(
 
 DOMAIN_PROMPT = PromptTemplate(
     template="""You are an expert domain scraper parser.
-Analyze the following connection details and homepage HTML snippet for {company_name} ({domain}) and extract key details.
-Context:
+Analyze the following connection details and combined HTML content scraped from multiple discovered domains for {company_name} ({domain}) and extract key details.
+Context (includes primary and discovered subdomains/aliases):
 {scraper_text}
 
 {format_instructions}
 Your output JSON must contain:
-- "domains": list of objects, each with "url" (string) and "https_encrypted" (boolean).
+- "domains": list of objects from the discovered_domains list, each with "url" (string) and "https_encrypted" (boolean). Include ALL discovered domains.
 - "privacy_policy_published": boolean (whether a privacy policy link or page is found in the HTML snippet or mentioned).
 - "compliance_mentions": list of strings (compliance frameworks mentioned in the HTML snippet, e.g. GDPR, CCPA, HIPAA).
-- "customer_type": "B2B" or "B2C" or "MIX" or null.
+- "customer_type": "B2B" or "B2C" or "MIX" or null. Consider all domains — if one is consumer-facing and another is business-facing, use "MIX".
 - "has_ecommerce": boolean (whether there are e-commerce/store/checkout indicators like shopping cart, shop, pricing, payment buttons, or catalog purchase flows in the HTML snippet).
 - "industries_served": list of strings (e.g. insurance, healthcare, banking, retail).
-- "customer_segments": list of strings (e.g. enterprise, business clients).
+- "customer_segments": list of strings (e.g. enterprise, business clients, personal, small business).
 - "business_model": string (e.g. B2B services / consulting).
 - "b2b_b2c_confidence": string (e.g. high, medium, low).
 - "ecommerce_evidence": string (e.g. No checkout/cart/payment flow detected).
@@ -159,6 +183,7 @@ Your output JSON must contain:
 """,
     required_vars=["company_name", "domain", "scraper_text"]
 )
+
 
 DOMAIN = CollectorAgentConfig(
     name="Domain Scraper",
