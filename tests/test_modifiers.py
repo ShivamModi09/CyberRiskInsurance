@@ -205,5 +205,32 @@ class TestModifiersAndParser(unittest.TestCase):
             # Quarterly revenue list should contain the two 3-month period values (450M and 480M) but ignore the 6-month YTD one (930M)
             self.assertEqual(findings["quarterly_revenue"], [450000000, 480000000])
 
+    def test_dynamic_sic_inference(self):
+        from src.processors import CollectionCoordinatorAgent
+        coordinator = self.factory.create_coordinator(CollectionCoordinatorAgent)
+        
+        # Test 1: Company name contains "insurance", should infer "6331"
+        reports = {
+            "Wikipedia": {"status": "success", "findings": {"industry_classification": ["Property and Casualty"]}},
+            "Wikidata": {"status": "success", "findings": {"industry": ["financial services"]}}
+        }
+        res1 = coordinator.infer_sic_codes_dynamically("Liberty Mutual Insurance Company", reports, ["7372"])
+        self.assertEqual(res1, ["6331"])
+
+        # Test 2: Wikipedia/Wikidata findings contain "hospital" or "healthcare", should infer "8062"
+        reports_health = {
+            "Wikipedia": {"status": "success", "findings": {"industry_classification": ["General Hospital", "Healthcare"]}}
+        }
+        res2 = coordinator.infer_sic_codes_dynamically("Any Hospital Group", reports_health, ["7372"])
+        self.assertEqual(res2, ["8062"])
+
+        # Test 3: Existing SIC code is not "7372", should keep it
+        res3 = coordinator.infer_sic_codes_dynamically("Liberty Mutual", reports, ["6331"])
+        self.assertEqual(res3, ["6331"])
+
+        # Test 4: Default fallback when nothing matches and no existing valid codes
+        res4 = coordinator.infer_sic_codes_dynamically("Generic Random Inc", {}, ["7372"])
+        self.assertEqual(res4, ["7372"])
+
 if __name__ == "__main__":
     unittest.main()

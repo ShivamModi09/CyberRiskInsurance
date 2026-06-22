@@ -62,7 +62,7 @@ class CyberRiskRatingState(TypedDict, total=False):
     confidence_score: float
     confidence_band: str
     human_escalation_flag: bool
-    audit_logs: list
+    audit_logs: Annotated[list, operator.add]
     token_summary: dict
 
 def supervisor_routing(state: CyberRiskRatingState) -> str:
@@ -120,7 +120,9 @@ def build_cyber_risk_rating_graph(enable_cache: bool = True):
         return {"reports": {"DBCollector": rep}, "collected_evidence": {"DBCollector": rep}}
 
     async def domain_node(state: CyberRiskRatingState) -> dict:
-        rep = await domain_agent.collect(state["company_name"], state["domain"])
+        responses_report = state.get("reports", {}).get("ResponsesAPI", {})
+        discovered = responses_report.get("findings", {}).get("official_websites", [])
+        rep = await domain_agent.collect(state["company_name"], state["domain"], discovered_domains=discovered)
         return {"reports": {"DomainScraper": rep}, "collected_evidence": {"DomainScraper": rep}}
 
     async def responses_node(state: CyberRiskRatingState) -> dict:
@@ -179,15 +181,14 @@ def build_cyber_risk_rating_graph(enable_cache: bool = True):
             "__end__": END
         }
     )
-    # Fanout connections
+    # Fanout connections (domain is now run sequentially after responses)
     g.add_conditional_edges(
         "supervisor_node",
-        lambda x: ["wikidata", "sec", "dnb", "domain", "responses"] if (x.get("valid") and not x.get("cache_hit")) else [],
+        lambda x: ["wikidata", "sec", "dnb", "responses"] if (x.get("valid") and not x.get("cache_hit")) else [],
         {
             "wikidata": "wikidata",
             "sec": "sec",
             "dnb": "dnb",
-            "domain": "domain",
             "responses": "responses"
         }
     )
@@ -197,8 +198,8 @@ def build_cyber_risk_rating_graph(enable_cache: bool = True):
     g.add_edge("wikidata", "coordinator")
     g.add_edge("sec", "coordinator")
     g.add_edge("dnb", "coordinator")
+    g.add_edge("responses", "domain")
     g.add_edge("domain", "coordinator")
-    g.add_edge("responses", "coordinator")
 
     # Sequential processors
     g.add_edge("coordinator", "fact_checker")

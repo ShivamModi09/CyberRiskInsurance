@@ -14,7 +14,7 @@ export default function EvidenceSources({ hasRun }) {
 
   return (
     <div className="glass-panel">
-      <h2 style={{ marginBottom: '20px' }}><Search size={20} color="var(--accent-cyan)" /> Evidence Sources Explainer</h2>
+      <h2 style={{ marginBottom: '20px' }}><Search size={20} color="var(--accent-orange)" /> Evidence Sources Explainer</h2>
       <p className="text-muted" style={{ fontSize: '0.875rem', marginBottom: '20px' }}>Breakdown of the raw data contributed by each parallel collector agent before reconciliation.</p>
       
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '16px' }}>

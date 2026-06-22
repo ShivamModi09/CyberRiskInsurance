@@ -52,7 +52,7 @@ export default function ModifierDetailsModal({ isOpen, onClose, modifier }) {
           width: '100%', maxWidth: '700px', maxHeight: '90vh',
           overflowY: 'auto',
           background: 'rgba(16, 23, 42, 0.95)',
-          border: '1px solid var(--accent-cyan)',
+          border: '1px solid var(--accent-orange)',
           position: 'relative'
         }}
         onClick={(e) => e.stopPropagation()}
@@ -65,7 +65,7 @@ export default function ModifierDetailsModal({ isOpen, onClose, modifier }) {
           <X size={24} />
         </button>
 
-        <h2 style={{ color: 'var(--accent-cyan)', marginBottom: '8px' }}>Modifier Details</h2>
+        <h2 style={{ color: 'var(--accent-orange)', marginBottom: '8px' }}>Modifier Details</h2>
         <div style={{ fontSize: '1.2rem', fontWeight: '600', color: 'var(--text-primary)', marginBottom: '24px' }}>
           {modifier.name}
         </div>
@@ -77,7 +77,7 @@ export default function ModifierDetailsModal({ isOpen, onClose, modifier }) {
           </div>
           <div style={{ background: 'rgba(0,0,0,0.3)', padding: '16px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)' }}>
             <div className="text-muted" style={{ fontSize: '0.75rem', textTransform: 'uppercase', marginBottom: '8px' }}>Raw Mathematical Score</div>
-            <div style={{ fontWeight: '700', fontSize: '1.1rem', fontFamily: 'monospace', color: 'var(--accent-cyan)' }}>{modifier.score}</div>
+            <div style={{ fontWeight: '700', fontSize: '1.1rem', fontFamily: 'monospace', color: 'var(--accent-orange)' }}>{modifier.score}</div>
           </div>
         </div>
 

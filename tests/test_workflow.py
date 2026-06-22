@@ -1,5 +1,8 @@
-import unittest
+import sys
 import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+import unittest
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import patch
 from src.workflows import build_cyber_risk_rating_graph
@@ -80,6 +83,8 @@ class TestWorkflowIntegration(IsolatedAsyncioTestCase):
             "audit_logs": []
         }
         
+        os.environ["ENABLE_RESPONSES_API"] = "true"
+
         # Define mock behavior for the LLM
         def mock_call_llm(self_agent, prompt: str, temperature: float = 0.0) -> str:
             if self_agent.tracker:
@@ -100,9 +105,20 @@ class TestWorkflowIntegration(IsolatedAsyncioTestCase):
                 return '{"revenue": 2000000000, "fiscal_year": 2025, "subsidiaries_count": 5, "quarterly_revenue": [500000000, 500000000, 500000000, 500000000]}'
             elif "domain" in agent_name:
                 return '{"domains": [{"url": "techgiant.com", "https_encrypted": true}], "privacy_policy_published": true, "compliance_mentions": [], "customer_type": "B2B", "has_ecommerce": false}'
+            elif "responses" in agent_name:
+                return '{"official_websites": ["https://techgiant.com", "https://techgiant-intl.com"], "revenue": 2000000000, "acquisitions": []}'
             return '{}'
 
-        with patch('src.base_agents.BaseAgent.call_llm', new=mock_call_llm):
+        def mock_search_google(self_agent, query: str, api_key: str) -> dict:
+            return {
+                "organic_results": [
+                    {"title": "TechGiant", "link": "https://techgiant.com", "snippet": "Official site of TechGiant..."},
+                    {"title": "TechGiant International", "link": "https://techgiant-intl.com", "snippet": "TechGiant International services..."}
+                ]
+            }
+
+        with patch('src.base_agents.BaseAgent.call_llm', new=mock_call_llm), \
+             patch('src.collectors.ResponsesAPICollectorAgent._search_google', new=mock_search_google):
             # 1. First execution - Cache Miss (calls mock)
             res_miss = await self.app.ainvoke(state)
             self.assertTrue(res_miss["valid"])

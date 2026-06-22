@@ -6,6 +6,78 @@ from typing import Dict, Any
 from langchain_groq import ChatGroq
 from src.config import PromptTemplate
 
+class OpenAIResponse:
+    def __init__(self, content: str, prompt_tokens: int, completion_tokens: int):
+        self.content = content
+        self.response_metadata = {
+            "token_usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens
+            }
+        }
+
+class SimpleChatOpenAI:
+    def __init__(
+        self, 
+        model: str, 
+        api_key: str, 
+        temperature: float = 0.0,
+        azure_endpoint: str = None,
+        azure_api_version: str = "2024-02-15-preview"
+    ):
+        self.model = model
+        self.api_key = api_key
+        self.temperature = temperature
+        self.azure_endpoint = azure_endpoint
+        self.azure_api_version = azure_api_version
+
+    def invoke(self, prompt: str) -> OpenAIResponse:
+        import urllib.request
+        import json
+        
+        # Format URL and headers differently for Azure vs standard OpenAI
+        if self.azure_endpoint:
+            base_url = self.azure_endpoint.rstrip('/')
+            url = f"{base_url}/openai/deployments/{self.model}/chat/completions?api-version={self.azure_api_version}"
+            headers = {
+                "Content-Type": "application/json",
+                "api-key": self.api_key
+            }
+        else:
+            url = "https://api.openai.com/v1/chat/completions"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}"
+            }
+            
+        data = {
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": self.temperature
+        }
+        
+        # Model parameter is only required in standard OpenAI payload, defined in URL path for Azure
+        if not self.azure_endpoint:
+            data["model"] = self.model
+        
+        req = urllib.request.Request(
+            url, 
+            data=json.dumps(data).encode("utf-8"), 
+            headers=headers,
+            method="POST"
+        )
+        
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                resp_data = json.loads(response.read().decode("utf-8"))
+                content = resp_data["choices"][0]["message"]["content"]
+                usage = resp_data.get("usage", {})
+                prompt_tokens = usage.get("prompt_tokens", 0)
+                completion_tokens = usage.get("completion_tokens", 0)
+                return OpenAIResponse(content, prompt_tokens, completion_tokens)
+        except Exception as e:
+            raise RuntimeError(f"LLM API call failed: {e}")
+
 class BaseAgent:
     def __init__(self, config: Any, tracker: Any = None):
         self.config = config
@@ -34,22 +106,46 @@ class BaseAgent:
         return template.format(**merged)
 
     def call_llm(self, prompt: str, temperature: float = 0.0) -> str:
-        api_key = os.environ.get("GROQ_API_KEY")
-        if not api_key:
-            raise ValueError("GROQ_API_KEY environment variable is missing. Live Groq API execution is required in production.")
+        azure_key = os.environ.get("AZURE_OPENAI_API_KEY")
+        azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+        openai_key = os.environ.get("OPENAI_API_KEY")
+        groq_key = os.environ.get("GROQ_API_KEY")
+        
+        if not azure_key and not openai_key and not groq_key:
+            raise ValueError(
+                "No LLM credentials configured. Please set AZURE_OPENAI_API_KEY, OPENAI_API_KEY, or GROQ_API_KEY."
+            )
 
         logger = self.get_logger()
         agent_name = getattr(self.config, 'name', self.__class__.__name__)
         logger.info(f"[{agent_name}] Invoking LLM for prompt/extraction...")
         logger.info(f"[{agent_name}] Prompt input sent to LLM:\n{prompt}")
 
-        # Initialize the live Groq model
-        model_name = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-        llm = ChatGroq(
-            model=model_name,
-            api_key=api_key,
-            temperature=temperature
-        )
+        if azure_key and azure_endpoint:
+            deployment_name = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
+            api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+            model_name = deployment_name
+            llm = SimpleChatOpenAI(
+                model=deployment_name,
+                api_key=azure_key,
+                temperature=temperature,
+                azure_endpoint=azure_endpoint,
+                azure_api_version=api_version
+            )
+        elif openai_key:
+            model_name = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+            llm = SimpleChatOpenAI(
+                model=model_name,
+                api_key=openai_key,
+                temperature=temperature
+            )
+        else:
+            model_name = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+            llm = ChatGroq(
+                model=model_name,
+                api_key=groq_key,
+                temperature=temperature
+            )
         
         try:
             res = llm.invoke(prompt)
@@ -65,8 +161,22 @@ class BaseAgent:
                     if self.tracker:
                         self.tracker.add_usage(prompt_tokens, completion_tokens)
             
-            # Calculate cost estimate based on $0.59/M input, $0.79/M output
-            cost = (prompt_tokens * 0.59 + completion_tokens * 0.79) / 1000000.0
+            # Calculate cost estimate based on model type
+            if azure_key or openai_key:
+                if "gpt-4o-mini" in model_name:
+                    input_rate = 0.15
+                    output_rate = 0.60
+                elif "gpt-4o" in model_name:
+                    input_rate = 2.50
+                    output_rate = 10.00
+                else:
+                    input_rate = 0.15
+                    output_rate = 0.60
+            else:
+                input_rate = 0.59
+                output_rate = 0.79
+                
+            cost = (prompt_tokens * input_rate + completion_tokens * output_rate) / 1000000.0
             
             # Log usage & outputs
             logger.info(f"[{agent_name}] LLM Response received. Usage: input={prompt_tokens}, output={completion_tokens}, reasoning=0, cached=0, tool_calls=0, cost=${cost:.6f}")
@@ -76,7 +186,7 @@ class BaseAgent:
         except Exception as e:
             import traceback
             logger.error(f"[{agent_name}] LLM invocation failed: {e}\nTraceback:\n{traceback.format_exc()}")
-            raise RuntimeError(f"Error calling live Groq model: {e}")
+            raise RuntimeError(f"Error calling live model: {e}")
 
     def parse_json(self, text: str) -> Dict[str, Any]:
         cleaned = text.strip()

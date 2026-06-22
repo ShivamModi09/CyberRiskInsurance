@@ -198,13 +198,29 @@ DOMAIN = CollectorAgentConfig(
     source_name="DomainScraper"
 )
 
+RESPONSES_PROMPT = PromptTemplate(
+    template="""You are an expert underwriter extraction agent.
+Analyze the following Google search results and snippets for {company_name} ({domain}) and extract key findings.
+Search Results:
+{search_text}
+
+{format_instructions}
+Your output JSON must contain:
+- "official_websites": list of string URLs or domains of the company and its subsidiaries found in search results.
+- "revenue": numerical value of revenue in USD (e.g. 15000000000) if explicitly found in the snippets or title, or null.
+- "acquisitions": list of objects for recent acquisitions found. Each object: {{"name": string, "deal_type": string, "recency_years": float}}.
+""",
+    required_vars=["company_name", "domain", "search_text"]
+)
+
 RESPONSES = CollectorAgentConfig(
     name="Responses API Collector",
     agent_type="responses",
-    prompt_template=PromptTemplate(template=""),
-    target_fields=[],
+    prompt_template=RESPONSES_PROMPT,
+    target_fields=["official_websites", "revenue", "acquisitions"],
     source_name="ResponsesAPI"
 )
+
 
 # Coordinator config
 COORD_PROMPT = PromptTemplate(
@@ -224,7 +240,7 @@ Output a single consolidated profile with the following fields:
 - "privacy_policy_published": boolean.
 - "compliance_mentions": list of strings (e.g., ["GDPR", "CCPA"]).
 - "quarterly_revenue": list of numbers or empty list.
-- "sic_codes": list of strings.
+- "sic_codes": list of strings (e.g., ["6331"] for insurance carriers, ["7372"] for prepackaged software, ["5311"] for department stores. If not explicitly found in collector findings, you must dynamically infer the most likely 4-digit SIC code based on the company's business activities or name, do not default to "7372" unless it is a software/tech company).
 - "services_appetite": "low_risk" or "medium_risk" or "high_risk".
 - "internet_exposure_domains": number of domains.
 - "customer_base_scale": "SMB (<1k)" or "Mid-Market" or "Enterprise".

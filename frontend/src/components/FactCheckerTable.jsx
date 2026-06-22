@@ -18,7 +18,7 @@ export default function FactCheckerTable({ data }) {
   return (
     <div className="glass-panel" style={{ overflowX: 'auto', maxHeight: '400px', padding: 0 }}>
       <div style={{ padding: '24px 24px 16px 24px' }}>
-        <h2 style={{ margin: 0 }}><ListChecks size={20} color="var(--accent-cyan)" /> Fact Checker Corroboration</h2>
+        <h2 style={{ margin: 0 }}><ListChecks size={20} color="var(--accent-orange)" /> Fact Checker Corroboration</h2>
       </div>
       <table className="data-table">
         <thead>

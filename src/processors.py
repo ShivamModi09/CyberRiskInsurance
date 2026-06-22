@@ -191,64 +191,7 @@ class CollectionCoordinatorAgent(BaseCoordinatorAgent):
                 merged["domains"] = val
                 break
 
-        # Coordinator Supplemental Domain Scrape:
-        # Extract official_websites from any collector, find new root domains not already
-        # covered by DomainScraper, run crt.sh on them, scrape, and merge into domain findings.
-        try:
-            import re
-            import socket
-            import ssl as ssl_lib
 
-            already_covered = {d["url"].lower() for d in merged.get("domains", [])}
-
-            # Collect official_websites from all sources
-            extra_urls = []
-            for src in sources_order:
-                urls = get_val(src, "official_websites") or []
-                if isinstance(urls, list):
-                    extra_urls.extend(urls)
-                single = get_val(src, "official_website")
-                if single and isinstance(single, str):
-                    extra_urls.append(single)
-
-            # Extract hostnames from URLs
-            new_roots = []
-            seen_roots = set()
-            for url in extra_urls:
-                try:
-                    from urllib.parse import urlparse
-                    parsed = urlparse(url if url.startswith("http") else f"https://{url}")
-                    host = parsed.hostname or ""
-                    host = re.sub(r'^www\.', '', host.lower())
-                    if host and host not in seen_roots:
-                        # Check if this root is not already covered
-                        already = any(host in covered for covered in already_covered)
-                        if not already:
-                            seen_roots.add(host)
-                            new_roots.append(host)
-                except Exception:
-                    pass
-
-            if new_roots:
-                # Import DomainScraperCollectorAgent for crt.sh + scrape reuse
-                from src.collectors import DomainScraperCollectorAgent
-                _scraper = DomainScraperCollectorAgent.__new__(DomainScraperCollectorAgent)
-
-                for root in new_roots:
-                    discovered = _scraper._crtsh_discover(root)
-                    for host in discovered:
-                        if host.lower() in already_covered:
-                            continue
-                        if not _scraper._is_reachable(host):
-                            continue
-                        ssl_valid = _scraper._check_ssl(host)
-                        page_text, reached = _scraper._scrape_domain(host, ssl_valid)
-                        if reached:
-                            merged["domains"].append({"url": host, "https_encrypted": ssl_valid})
-                            already_covered.add(host.lower())
-                            logger.info(f"[Coordinator Supplemental Scrape] Added new domain: {host} (HTTPS: {ssl_valid})")
-        except Exception as e:
-            logger.warning(f"[Coordinator Supplemental Scrape] Failed: {e}")
 
         # Call LLM to reconcile profile and write rationale
         prompt_vars = {
@@ -266,6 +209,13 @@ class CollectionCoordinatorAgent(BaseCoordinatorAgent):
                 if isinstance(v, list) and len(v) == 0 and isinstance(merged[k], list) and len(merged[k]) > 0:
                     continue
                 merged[k] = v
+
+        # Dynamic fallback inference for SIC codes if missing or defaulting to 7372
+        final_sic = merged.get("sic_codes", [])
+        if not final_sic or final_sic == ["7372"]:
+            inferred_sic = self.infer_sic_codes_dynamically(company_name, reports, final_sic)
+            logger.info(f"[COORDINATOR] Dynamic SIC inference resolved: {inferred_sic} (original was {final_sic})")
+            merged["sic_codes"] = inferred_sic
 
         # Re-verify USA Presence
         countries_lower = [c.lower() for c in merged["countries_of_operation"]]
@@ -295,6 +245,69 @@ class CollectionCoordinatorAgent(BaseCoordinatorAgent):
             "conflict_flags": conflict_flags,
             "audit_logs": state.get("audit_logs", []) + logs
         }
+
+    def infer_sic_codes_dynamically(self, company_name: str, reports: Dict[str, Any], existing_sic_codes: List[str] = None) -> List[str]:
+        # Gather all industry text indicators from Wikipedia, Wikidata, SEC
+        indicators = []
+        
+        # Check Wikipedia industry classification
+        wiki_report = reports.get("Wikipedia", {})
+        if wiki_report.get("status") == "success":
+            ind_class = wiki_report.get("findings", {}).get("industry_classification", [])
+            if isinstance(ind_class, list):
+                indicators.extend(ind_class)
+                
+        # Check Wikidata industry and sub_industries
+        wikidata_report = reports.get("Wikidata", {})
+        if wikidata_report.get("status") == "success":
+            findings = wikidata_report.get("findings", {})
+            ind = findings.get("industry", [])
+            if isinstance(ind, list):
+                indicators.extend(ind)
+            sub_ind = findings.get("sub_industries", [])
+            if isinstance(sub_ind, list):
+                indicators.extend(sub_ind)
+
+        # Check SEC segments/SIC codes
+        sec_report = reports.get("SECCollector", {})
+        if sec_report.get("status") == "success":
+            findings = sec_report.get("findings", {})
+            segments = findings.get("business_segments", [])
+            if isinstance(segments, list):
+                indicators.extend(segments)
+            # Check if SEC already provided some SIC codes
+            sec_sics = findings.get("sic_codes", [])
+            if sec_sics and isinstance(sec_sics, list):
+                valid_sec_sics = [str(s) for s in sec_sics if str(s).strip() and str(s).strip() != "7372"]
+                if valid_sec_sics:
+                    return valid_sec_sics
+
+        # Normalize indicators and company name to lowercase
+        all_text = " ".join([company_name] + [str(ind) for ind in indicators]).lower()
+        
+        # Industry keyword mapping to standard SIC code
+        # - Insurance: SIC 6331 (Fire, Marine, and Casualty Insurance)
+        if any(keyword in all_text for keyword in ["insurance", "casualty", "mutual", "assurance", "reinsurance", "underwriter", "underwriting", "indemnity"]):
+            return ["6331"]
+        # - Banks / Finance: SIC 6021 (National Commercial Banks)
+        elif any(keyword in all_text for keyword in ["bank", "finance", "credit", "lending", "capital", "financial", "securities", "banking", "investment"]):
+            return ["6021"]
+        # - Department stores / retail: SIC 5311
+        elif any(keyword in all_text for keyword in ["retail", "store", "shop", "department store", "supermarket", "clothing", "apparel", "e-commerce"]):
+            return ["5311"]
+        # - Hospitals / Healthcare: SIC 8062
+        elif any(keyword in all_text for keyword in ["hospital", "clinic", "medical", "healthcare", "health system", "pharma", "pharmaceutical"]):
+            return ["8062"]
+        # - Tech / Software: SIC 7372
+        elif any(keyword in all_text for keyword in ["software", "technology", "saas", "packaged software", "it services", "computer", "application"]):
+            return ["7372"]
+            
+        # If we have existing SIC codes and they aren't empty/default to 7372, use them
+        if existing_sic_codes and len(existing_sic_codes) > 0 and existing_sic_codes != ["7372"]:
+            return existing_sic_codes
+            
+        # Default fallback
+        return ["7372"]
 
 class FactCheckerAgent(BaseFactCheckerAgent):
     async def verify(self, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -381,10 +394,21 @@ class UnderwriterAgent(BaseUnderwriterAgent):
         modifier_scores = {}
         underwriting_rationale = {}
 
-        # M&A
+        from src.utils.logger import get_agent_logger
+
+        # --- 1. Mergers and Acquisitions ---
+        ma_logger = get_agent_logger("Mergers and Acquisitions")
+        ma_logger.info("========================================")
+        ma_logger.info("Modifier Evaluation: Mergers and Acquisitions")
+        ma_logger.info("========================================")
         acqs = reconciled.get("acquisitions", [])
+        ma_logger.info(f"Input: acquisitions = {json.dumps(acqs)}")
+        ma_logger.info(f"Input: revenue = {revenue}")
+        ma_logger.info("Math Logic: Points calculated by deal type and recency multiplier. Thresholds depend on revenue tier.")
+
         ma_points = 0.0
-        for acq in acqs:
+        for i, acq in enumerate(acqs):
+            acq_name = acq.get("name", f"Acquisition {i+1}")
             deal_type = str(acq.get("deal_type", "minor acquisition")).lower()
             pts = 1.0
             if "trans" in deal_type:
@@ -395,8 +419,11 @@ class UnderwriterAgent(BaseUnderwriterAgent):
                 pts = 2.0
             
             recency = acq.get("recency_years", 5.0)
+            orig_recency = recency
             if recency > 1900:
                 recency = datetime.now().year - recency
+            
+            mult = 0.0
             if recency < 1.0:
                 mult = 2.0
             elif recency < 2.0:
@@ -408,10 +435,16 @@ class UnderwriterAgent(BaseUnderwriterAgent):
             else:
                 mult = 0.0
 
-            ma_points += (pts * mult)
+            acq_points = pts * mult
+            ma_points += acq_points
+            ma_logger.info(f"Processing acquisition '{acq_name}': deal_type='{deal_type}' -> base_points={pts}, recency_years={orig_recency} (elapsed={recency:.1f} yrs) -> recency_multiplier={mult}. Computed points = {acq_points:.2f}")
+
+        ma_logger.info(f"Total accumulated M&A points: {ma_points:.2f}")
 
         ma_rating = "average"
         if revenue >= 1000000000:
+            ma_logger.info("Revenue Tier: >= $1B")
+            ma_logger.info(f"Evaluating ma_points={ma_points:.2f} against thresholds: <=5 Very Favourable, <=10 Favourable, <=15 Partially Favourable, <=20 Average, <=30 Partially Unfavourable, >30 Unfavourable")
             if ma_points <= 5: ma_rating = "very favourable"
             elif ma_points <= 10: ma_rating = "favourable"
             elif ma_points <= 15: ma_rating = "partially favourable"
@@ -419,6 +452,8 @@ class UnderwriterAgent(BaseUnderwriterAgent):
             elif ma_points <= 30: ma_rating = "partially unfavourable"
             else: ma_rating = "unfavourable"
         elif revenue >= 250000000:
+            ma_logger.info("Revenue Tier: >= $250M")
+            ma_logger.info(f"Evaluating ma_points={ma_points:.2f} against thresholds: <=3 Very Favourable, <=6 Favourable, <=10 Partially Favourable, <=15 Average, <=20 Partially Unfavourable, >20 Unfavourable")
             if ma_points <= 3: ma_rating = "very favourable"
             elif ma_points <= 6: ma_rating = "favourable"
             elif ma_points <= 10: ma_rating = "partially favourable"
@@ -426,6 +461,8 @@ class UnderwriterAgent(BaseUnderwriterAgent):
             elif ma_points <= 20: ma_rating = "partially unfavourable"
             else: ma_rating = "unfavourable"
         elif revenue >= 50000000:
+            ma_logger.info("Revenue Tier: >= $50M")
+            ma_logger.info(f"Evaluating ma_points={ma_points:.2f} against thresholds: <=2 Very Favourable, <=4 Favourable, <=7 Partially Favourable, <=10 Average, <=15 Partially Unfavourable, >15 Unfavourable")
             if ma_points <= 2: ma_rating = "very favourable"
             elif ma_points <= 4: ma_rating = "favourable"
             elif ma_points <= 7: ma_rating = "partially favourable"
@@ -433,6 +470,8 @@ class UnderwriterAgent(BaseUnderwriterAgent):
             elif ma_points <= 15: ma_rating = "partially unfavourable"
             else: ma_rating = "unfavourable"
         else:
+            ma_logger.info("Revenue Tier: < $50M")
+            ma_logger.info(f"Evaluating ma_points={ma_points:.2f} against thresholds: <=1 Very Favourable, <=3 Favourable, <=5 Partially Favourable, <=7 Average, <=10 Partially Unfavourable, >10 Unfavourable")
             if ma_points <= 1: ma_rating = "very favourable"
             elif ma_points <= 3: ma_rating = "favourable"
             elif ma_points <= 5: ma_rating = "partially favourable"
@@ -442,77 +481,190 @@ class UnderwriterAgent(BaseUnderwriterAgent):
 
         modifier_scores["Mergers and Acquisitions"] = {"score": ma_points, "rating": ma_rating}
         underwriting_rationale["Mergers and Acquisitions"] = f"M&A score calculated at {ma_points:.1f} across {len(acqs)} acquisitions."
+        ma_logger.info(f"Resulting Rating: {ma_rating}")
+        ma_logger.info("========================================\n")
 
-        # Sensitive Info
+
+        # --- 2. Amount of sensitive information ---
+        sens_logger = get_agent_logger("Amount of sensitive information")
+        sens_logger.info("========================================")
+        sens_logger.info("Modifier Evaluation: Amount of sensitive information")
+        sens_logger.info("========================================")
         cust_type = str(reconciled.get("customer_type", "B2B")).upper()
         has_ecom = reconciled.get("has_ecommerce", False)
+        sens_logger.info(f"Input: customer_type = {cust_type}")
+        sens_logger.info(f"Input: has_ecommerce = {has_ecom}")
+        sens_logger.info("Math Logic: B2C/MIX + ecommerce => partially unfavourable; B2C/MIX + no ecommerce => average; B2B + ecommerce => partially favourable; B2B + no ecommerce => favourable.")
+        
         if "B2C" in cust_type or "MIX" in cust_type:
+            sens_logger.info(f"Customer type '{cust_type}' indicates consumer/mixed exposure.")
             if has_ecom:
+                sens_logger.info("E-commerce is present: rating set to 'partially unfavourable'")
                 sens_rating = "partially unfavourable"
             else:
+                sens_logger.info("No e-commerce detected: rating set to 'average'")
                 sens_rating = "average"
         elif "B2B" in cust_type:
+            sens_logger.info(f"Customer type '{cust_type}' indicates B2B-only exposure.")
             if has_ecom:
+                sens_logger.info("E-commerce is present: rating set to 'partially favourable'")
                 sens_rating = "partially favourable"
             else:
+                sens_logger.info("No e-commerce detected: rating set to 'favourable'")
                 sens_rating = "favourable"
         else:
+            sens_logger.info(f"Unknown customer type '{cust_type}': fallback rating set to 'partially unfavourable'")
             sens_rating = "partially unfavourable"
+            
         modifier_scores["Amount of sensitive information"] = {"score": 0.0, "rating": sens_rating}
         underwriting_rationale["Amount of sensitive information"] = f"Customer type: {cust_type}, E-commerce presence: {has_ecom}."
+        sens_logger.info(f"Resulting Rating: {sens_rating}")
+        sens_logger.info("========================================\n")
 
-        # Domain Encryption
+
+        # --- 3. Domain Encryption ---
+        enc_logger = get_agent_logger("Domain Encryption")
+        enc_logger.info("========================================")
+        enc_logger.info("Modifier Evaluation: Domain Encryption")
+        enc_logger.info("========================================")
         domains = reconciled.get("domains", [])
         total_domains = len(domains)
-        enc_count = sum(1 for d in domains if d.get("https_encrypted", False))
+        enc_logger.info(f"Input: domains = {json.dumps(domains)}")
+        enc_logger.info("Math Logic: Ratio of HTTPS encrypted domains. All encrypted => favourable; Some => partially favourable; None => average.")
+        
+        enc_count = 0
+        for d in domains:
+            url = d.get("url")
+            encrypted = d.get("https_encrypted", False)
+            if encrypted:
+                enc_count += 1
+            enc_logger.info(f"Domain '{url}' check: https_encrypted={encrypted}")
+            
         enc_rating = "average"
         if total_domains > 0:
+            enc_logger.info(f"Encryption ratio: {enc_count}/{total_domains} domains encrypted.")
             if enc_count == total_domains:
+                enc_logger.info("All domains are encrypted: rating set to 'favourable'")
                 enc_rating = "favourable"
             elif enc_count > 0:
+                enc_logger.info("Some domains are encrypted: rating set to 'partially favourable'")
                 enc_rating = "partially favourable"
             else:
+                enc_logger.info("No domains are encrypted: rating set to 'average'")
                 enc_rating = "average"
+        else:
+            enc_logger.info("No domains registered: rating set to 'average'")
+            enc_rating = "average"
+            
         modifier_scores["Domain Encryption"] = {"score": f"{enc_count}/{total_domains}", "rating": enc_rating}
         underwriting_rationale["Domain Encryption"] = f"HTTPS Encryption ratio: {enc_count} of {total_domains} domains encrypted."
+        enc_logger.info(f"Resulting Rating: {enc_rating}")
+        enc_logger.info("========================================\n")
 
-        # Geographic Spread
+
+        # --- 4. Geographic Spread ---
+        geo_logger = get_agent_logger("Geographic Spread")
+        geo_logger.info("========================================")
+        geo_logger.info("Modifier Evaluation: Geographic Spread")
+        geo_logger.info("========================================")
         countries = reconciled.get("countries_of_operation", ["USA"])
         c_count = len(countries)
-        cont_count = len(reconciled.get("continent_spread", ["North America"]))
+        continents = reconciled.get("continent_spread", ["North America"])
+        cont_count = len(continents)
         usa_p = reconciled.get("usa_presence", True)
+        
+        geo_logger.info(f"Input: countries_of_operation = {countries} (count: {c_count})")
+        geo_logger.info(f"Input: continent_spread = {continents} (count: {cont_count})")
+        geo_logger.info(f"Input: usa_presence = {usa_p}")
+        geo_logger.info(f"Input: revenue = {revenue}")
+        geo_logger.info("Math Logic: Evaluates country count and continent spread against revenue tier thresholds.")
+        
         geo_rating = "average"
         if revenue >= 1000000000:
-            if c_count <= 10 and cont_count == 1: geo_rating = "favourable"
-            elif c_count <= 10: geo_rating = "partially favourable"
+            geo_logger.info("Revenue Tier: >= $1B")
+            geo_logger.info(f"Evaluating c_count={c_count}, cont_count={cont_count} against thresholds: c_count<=10 and cont_count==1 => Favourable; c_count<=10 => Partially Favourable; else Average")
+            if c_count <= 10 and cont_count == 1: 
+                geo_rating = "favourable"
+            elif c_count <= 10: 
+                geo_rating = "partially favourable"
+            else:
+                geo_rating = "average"
         elif revenue >= 250000000:
-            if c_count <= 5 and cont_count == 1: geo_rating = "favourable"
-            elif c_count <= 7: geo_rating = "partially favourable"
+            geo_logger.info("Revenue Tier: >= $250M")
+            geo_logger.info(f"Evaluating c_count={c_count}, cont_count={cont_count} against thresholds: c_count<=5 and cont_count==1 => Favourable; c_count<=7 => Partially Favourable; else Average")
+            if c_count <= 5 and cont_count == 1: 
+                geo_rating = "favourable"
+            elif c_count <= 7: 
+                geo_rating = "partially favourable"
+            else:
+                geo_rating = "average"
         elif revenue >= 50000000:
-            if c_count <= 3 and cont_count == 1: geo_rating = "favourable"
-            elif c_count <= 5: geo_rating = "partially favourable"
+            geo_logger.info("Revenue Tier: >= $50M")
+            geo_logger.info(f"Evaluating c_count={c_count}, cont_count={cont_count} against thresholds: c_count<=3 and cont_count==1 => Favourable; c_count<=5 => Partially Favourable; else Average")
+            if c_count <= 3 and cont_count == 1: 
+                geo_rating = "favourable"
+            elif c_count <= 5: 
+                geo_rating = "partially favourable"
+            else:
+                geo_rating = "average"
         else:
-            if c_count <= 2 and cont_count == 1: geo_rating = "favourable"
-            elif c_count <= 10: geo_rating = "partially favourable"
+            geo_logger.info("Revenue Tier: < $50M")
+            geo_logger.info(f"Evaluating c_count={c_count}, cont_count={cont_count} against thresholds: c_count<=2 and cont_count==1 => Favourable; c_count<=10 => Partially Favourable; else Average")
+            if c_count <= 2 and cont_count == 1: 
+                geo_rating = "favourable"
+            elif c_count <= 10: 
+                geo_rating = "partially favourable"
+            else:
+                geo_rating = "average"
+                
         modifier_scores["Geographic Spread"] = {"score": c_count, "rating": geo_rating}
         underwriting_rationale["Geographic Spread"] = f"Operates in {c_count} countries. USA presence: {usa_p}."
+        geo_logger.info(f"Resulting Rating: {geo_rating}")
+        geo_logger.info("========================================\n")
 
-        # Internet Footprint
+
+        # --- 5. Internet Footprint ---
+        foot_logger = get_agent_logger("Internet footprint")
+        foot_logger.info("========================================")
+        foot_logger.info("Modifier Evaluation: Internet footprint")
+        foot_logger.info("========================================")
         domain_count = int(reconciled.get("internet_exposure_domains", 1))
         scale = reconciled.get("customer_base_scale", "SMB (<1k)")
+        
+        foot_logger.info(f"Input: internet_exposure_domains = {domain_count}")
+        foot_logger.info(f"Input: customer_base_scale = {scale}")
+        
         mult = 1.0
-        if "Enterprise" in scale: mult = 3.0
-        elif "Mid-Market" in scale: mult = 2.0
+        if "Enterprise" in scale: 
+            mult = 3.0
+        elif "Mid-Market" in scale: 
+            mult = 2.0
+            
         footprint_score = domain_count * mult
+        foot_logger.info(f"Resolved scale multiplier: {mult}. Computed footprint score (domain_count * multiplier) = {footprint_score}")
+        
         footprint_rating = "average"
-        if footprint_score <= 5: footprint_rating = "favourable"
-        elif footprint_score <= 20: footprint_rating = "average"
-        elif footprint_score <= 100: footprint_rating = "partially unfavourable"
-        else: footprint_rating = "unfavourable"
+        foot_logger.info(f"Evaluating footprint_score={footprint_score} against thresholds: <=5 Favourable, <=20 Average, <=100 Partially Unfavourable, >100 Unfavourable")
+        if footprint_score <= 5: 
+            footprint_rating = "favourable"
+        elif footprint_score <= 20: 
+            footprint_rating = "average"
+        elif footprint_score <= 100: 
+            footprint_rating = "partially unfavourable"
+        else: 
+            footprint_rating = "unfavourable"
+            
         modifier_scores["Internet footprint"] = {"score": footprint_score, "rating": footprint_rating}
         underwriting_rationale["Internet footprint"] = f"Footprint score: {footprint_score} based on scale multiplier."
+        foot_logger.info(f"Resulting Rating: {footprint_rating}")
+        foot_logger.info("========================================\n")
 
-        # Nature of services
+
+        # --- 6. Nature of Services ---
+        serv_logger = get_agent_logger("Nature of services")
+        serv_logger.info("========================================")
+        serv_logger.info("Modifier Evaluation: Nature of services")
+        serv_logger.info("========================================")
         evidence = state.get("collected_evidence", {})
         
         # Helper to convert to string
@@ -532,27 +684,42 @@ class UnderwriterAgent(BaseUnderwriterAgent):
         sic_str = _to_str(reconciled.get("sic_codes", []))
         compliance_str = _to_str(domain_findings.get("compliance_mentions", [])) + ", " + _to_str(reconciled.get("customer_type", ""))
 
+        serv_logger.info(f"Gathered text signals:")
+        serv_logger.info(f"- Products/Services Portfolio: '{products_str}'")
+        serv_logger.info(f"- Industry Classifications: '{industry_str}'")
+        serv_logger.info(f"- SIC Codes: '{sic_str}'")
+        serv_logger.info(f"- Compliance & Customer Type: '{compliance_str}'")
+
         # 2. Reference keywords mapping function
         high_risk_kw = ["healthcare", "hospital", "patient", "clinical", "insurance", "banking", "financial services", "payment", "lending", "fintech"]
         medium_risk_kw = ["cloud", "saas", "software", "enterprise software", "ai", "cybersecurity", "data platform", "manufacturing", "logistics", "education", "retail"]
         low_risk_kw = ["low digital exposure", "simple services"]
 
-        def score_text(text: str):
+        def score_text_logged(text: str, category_name: str):
             t = text.lower()
-            if not t.strip() or t.strip() == ", ,": return None, None
+            if not t.strip() or t.strip() == ", ,": 
+                serv_logger.info(f"Category '{category_name}' text is empty. Skipping.")
+                return None, None
             for kw in high_risk_kw:
-                if kw in t: return 3.0, kw
+                if kw in t: 
+                    serv_logger.info(f"Category '{category_name}' matched High Risk keyword: '{kw}' (3.0 pts)")
+                    return 3.0, kw
             for kw in medium_risk_kw:
-                if kw in t: return 2.0, kw
+                if kw in t: 
+                    serv_logger.info(f"Category '{category_name}' matched Medium Risk keyword: '{kw}' (2.0 pts)")
+                    return 2.0, kw
             for kw in low_risk_kw:
-                if kw in t: return 1.0, kw
+                if kw in t: 
+                    serv_logger.info(f"Category '{category_name}' matched Low Risk keyword: '{kw}' (1.0 pts)")
+                    return 1.0, kw
+            serv_logger.info(f"Category '{category_name}' text has no matching risk keywords.")
             return None, None
 
         # 3. Evaluate each signal category
-        p_score, p_kw = score_text(products_str)
-        i_score, i_kw = score_text(industry_str)
-        s_score, s_kw = score_text(sic_str)
-        c_score, c_kw = score_text(compliance_str)
+        p_score, p_kw = score_text_logged(products_str, "Products")
+        i_score, i_kw = score_text_logged(industry_str, "Industry")
+        s_score, s_kw = score_text_logged(sic_str, "SIC")
+        c_score, c_kw = score_text_logged(compliance_str, "Compliance/Customer")
 
         # 4. Compute weighted decision
         weights = {"p": 0.40, "i": 0.30, "s": 0.20, "c": 0.10}
@@ -562,22 +729,26 @@ class UnderwriterAgent(BaseUnderwriterAgent):
         if p_score is not None:
             total_score += p_score * weights["p"]
             total_weight += weights["p"]
+            serv_logger.info(f"Weighted Products: score={p_score} * weight={weights['p']} = {p_score * weights['p']:.2f}")
         if i_score is not None:
             total_score += i_score * weights["i"]
             total_weight += weights["i"]
+            serv_logger.info(f"Weighted Industry: score={i_score} * weight={weights['i']} = {i_score * weights['i']:.2f}")
         if s_score is not None:
             total_score += s_score * weights["s"]
             total_weight += weights["s"]
+            serv_logger.info(f"Weighted SIC: score={s_score} * weight={weights['s']} = {s_score * weights['s']:.2f}")
         if c_score is not None:
             total_score += c_score * weights["c"]
             total_weight += weights["c"]
+            serv_logger.info(f"Weighted Compliance: score={c_score} * weight={weights['c']} = {c_score * weights['c']:.2f}")
 
         appetite = None
         if total_weight > 0:
-            # Normalize score against available weights
             final_score = total_score / total_weight
+            serv_logger.info(f"Normalized Weighted Score: {total_score:.4f} / {total_weight:.2f} = {final_score:.4f}")
             
-            # Weighted scoring tiers mapping
+            serv_logger.info("Evaluating final_score against thresholds: >=2.5 High Risk, >=1.5 Medium Risk, else Low Risk")
             if final_score >= 2.5:
                 appetite = "high_risk"
             elif final_score >= 1.5:
@@ -597,9 +768,9 @@ class UnderwriterAgent(BaseUnderwriterAgent):
             lines.append(f"Assigned {appetite} according to reference table.")
             rationale_text = " | ".join(lines)
         else:
-            # Fallback
             appetite = reconciled.get("services_appetite", "medium_risk")
             rationale_text = f"Nature of Services evaluated from fallback. Mapped to {appetite}."
+            serv_logger.info(f"No text keywords matched. Falling back to default services_appetite: '{appetite}'")
 
         if "low_risk" in appetite: 
             services_rating = "favourable"
@@ -610,158 +781,296 @@ class UnderwriterAgent(BaseUnderwriterAgent):
             
         modifier_scores["Nature of services"] = {"score": appetite, "rating": services_rating}
         underwriting_rationale["Nature of services"] = rationale_text
+        serv_logger.info(f"Resulting Rating: {services_rating}")
+        serv_logger.info("========================================\n")
 
 
-        # Org Complexity
+        # --- 7. Organizational Complexity ---
+        org_logger = get_agent_logger("Organizational Complexity")
+        org_logger.info("========================================")
+        org_logger.info("Modifier Evaluation: Organizational Complexity")
+        org_logger.info("========================================")
         subs_count = len(reconciled.get("subsidiaries", []))
+        org_logger.info(f"Input: subsidiaries count = {subs_count}")
+        org_logger.info(f"Input: revenue = {revenue}")
+        org_logger.info("Math Logic: Subsidiary count evaluated against revenue tier thresholds.")
+        
         org_rating = "average"
         if revenue >= 1000000000:
+            org_logger.info("Revenue Tier: >= $1B")
+            org_logger.info(f"Evaluating subs_count={subs_count} against thresholds: <10 Very Favourable, <=20 Favourable, <=50 Average, >50 Partially Unfavourable")
             if subs_count < 10: org_rating = "very favourable"
             elif subs_count <= 20: org_rating = "favourable"
             elif subs_count <= 50: org_rating = "average"
             else: org_rating = "partially unfavourable"
         elif revenue >= 250000000:
+            org_logger.info("Revenue Tier: >= $250M")
+            org_logger.info(f"Evaluating subs_count={subs_count} against thresholds: <7 Very Favourable, <=15 Favourable, <=30 Average, >30 Partially Unfavourable")
             if subs_count < 7: org_rating = "very favourable"
             elif subs_count <= 15: org_rating = "favourable"
             elif subs_count <= 30: org_rating = "average"
             else: org_rating = "partially unfavourable"
         elif revenue >= 50000000:
+            org_logger.info("Revenue Tier: >= $50M")
+            org_logger.info(f"Evaluating subs_count={subs_count} against thresholds: <5 Very Favourable, <=10 Favourable, <=15 Average, >15 Partially Unfavourable")
             if subs_count < 5: org_rating = "very favourable"
             elif subs_count <= 10: org_rating = "favourable"
             elif subs_count <= 15: org_rating = "average"
             else: org_rating = "partially unfavourable"
         else:
+            org_logger.info("Revenue Tier: < $50M")
+            org_logger.info(f"Evaluating subs_count={subs_count} against thresholds: <3 Very Favourable, <=6 Favourable, <=10 Average, >10 Partially Unfavourable")
             if subs_count < 3: org_rating = "very favourable"
             elif subs_count <= 6: org_rating = "favourable"
             elif subs_count <= 10: org_rating = "average"
             else: org_rating = "partially unfavourable"
+            
         modifier_scores["Organizational Complexity"] = {"score": subs_count, "rating": org_rating}
         underwriting_rationale["Organizational Complexity"] = f"Total subsidiaries: {subs_count} evaluated against revenue tier."
+        org_logger.info(f"Resulting Rating: {org_rating}")
+        org_logger.info("========================================\n")
 
-        # Privacy Regulation
+
+        # --- 8. Privacy Regulation ---
+        priv_logger = get_agent_logger("Privacy Regulation")
+        priv_logger.info("========================================")
+        priv_logger.info("Modifier Evaluation: Privacy Regulation")
+        priv_logger.info("========================================")
         has_policy = reconciled.get("privacy_policy_published", False)
         mentions = reconciled.get("compliance_mentions", [])
         m_count = len(mentions)
+        
+        priv_logger.info(f"Input: privacy_policy_published = {has_policy}")
+        priv_logger.info(f"Input: compliance_mentions = {mentions} (count: {m_count})")
+        priv_logger.info("Math Logic: Policy published and compliance count >= 2 => favourable; count == 1 => partially favourable; no policy => partially unfavourable.")
+        
         priv_rating = "average"
         if has_policy:
-            if m_count >= 2: priv_rating = "favourable"
-            elif m_count == 1: priv_rating = "partially favourable"
+            priv_logger.info("Privacy policy is published. Checking compliance mentions count:")
+            if m_count >= 2: 
+                priv_logger.info("Compliance count >= 2: rating set to 'favourable'")
+                priv_rating = "favourable"
+            elif m_count == 1: 
+                priv_logger.info("Compliance count == 1: rating set to 'partially favourable'")
+                priv_rating = "partially favourable"
+            else:
+                priv_logger.info("Compliance count == 0: rating set to 'average'")
+                priv_rating = "average"
         else:
+            priv_logger.info("Privacy policy is NOT published: rating set to 'partially unfavourable'")
             priv_rating = "partially unfavourable"
+            
         modifier_scores["Privacy Regulation"] = {"score": m_count, "rating": priv_rating}
         underwriting_rationale["Privacy Regulation"] = f"Privacy Policy published: {has_policy}, compliance count: {m_count}."
+        priv_logger.info(f"Resulting Rating: {priv_rating}")
+        priv_logger.info("========================================\n")
 
-        # Seasonality of Sales
+
+        # --- 9. Seasonality of Sales ---
+        seas_logger = get_agent_logger("Seasonality of sales")
+        seas_logger.info("========================================")
+        seas_logger.info("Modifier Evaluation: Seasonality of sales")
+        seas_logger.info("========================================")
         q_rev = reconciled.get("quarterly_revenue", [])
         sic_codes = reconciled.get("sic_codes", ["7372"])
         sic = sic_codes[0] if sic_codes else "7372"
         cv = None
         season_rating = "average"
+        
+        seas_logger.info(f"Input: quarterly_revenue = {q_rev}")
+        seas_logger.info(f"Input: sic_codes = {sic_codes}")
+        seas_logger.info("Math Logic: If quarterly revenue count >= 4, CV = std/mean. CV < 0.1 => favourable, CV <= 0.25 => average, else partially unfavourable. Else fallback to SIC-based rule.")
+        
         if len(q_rev) >= 4:
             mean = np.mean(q_rev)
             std = np.std(q_rev)
+            seas_logger.info(f"Quarterly revenue data available. Calculated mean = {mean:.2f}, standard deviation = {std:.2f}")
             if mean > 0:
                 cv = std / mean
-                if cv < 0.1: season_rating = "favourable"
-                elif cv <= 0.25: season_rating = "average"
-                else: season_rating = "partially unfavourable"
+                seas_logger.info(f"Computed Coefficient of Variation (CV) = {cv:.4f}")
+                seas_logger.info(f"Evaluating CV against thresholds: <0.1 Favourable, <=0.25 Average, else Partially Unfavourable")
+                if cv < 0.1: 
+                    season_rating = "favourable"
+                elif cv <= 0.25: 
+                    season_rating = "average"
+                else: 
+                    season_rating = "partially unfavourable"
                 underwriting_rationale["Seasonality of sales"] = f"Sales CV: {cv:.3f} calculated from quarterly revenues."
             else:
+                seas_logger.info("Mean is zero or negative. Fallback to average seasonality.")
                 underwriting_rationale["Seasonality of sales"] = "Zero mean quarterly revenue, fallback to average seasonality."
         else:
+            seas_logger.info(f"Quarterly revenue data count is {len(q_rev)} (fewer than 4). Using SIC fallback code: '{sic}'")
             if sic == "5311":
+                seas_logger.info("SIC is 5311 (Department Stores): high seasonality expected, rating set to 'partially unfavourable'")
                 season_rating = "partially unfavourable"
                 underwriting_rationale["Seasonality of sales"] = "Fallback to Retail SIC: high seasonality expected."
             else:
+                seas_logger.info(f"SIC '{sic}' is not 5311: average seasonality expected, rating set to 'average'")
                 season_rating = "average"
                 underwriting_rationale["Seasonality of sales"] = "Fallback to services SIC: average seasonality expected."
+                
         modifier_scores["Seasonality of sales"] = {"score": cv if cv is not None else 0.0, "rating": season_rating}
+        seas_logger.info(f"Resulting Rating: {season_rating}")
+        seas_logger.info("========================================\n")
 
-        # Volatility / Recovery in Sales
+
+        # --- 10. Volatility/Recovery in Sales ---
+        vol_logger = get_agent_logger("Volatility/Recovery in Sales")
+        vol_logger.info("========================================")
+        vol_logger.info("Modifier Evaluation: Volatility/Recovery in Sales")
+        vol_logger.info("========================================")
         de = reconciled.get("digital_exposure", 3)
         ds = reconciled.get("disruption_speed", 3)
         rc = reconciled.get("recovery_complexity", 3)
+        
+        vol_logger.info(f"Input: digital_exposure = {de}")
+        vol_logger.info(f"Input: disruption_speed = {ds}")
+        vol_logger.info(f"Input: recovery_complexity = {rc}")
+        
         vol_avg = (de + ds + rc) / 3.0
+        vol_logger.info(f"Computed average index (exposure + speed + complexity) / 3 = {vol_avg:.4f}")
+        
         vol_rating = "average"
-        if vol_avg <= 2.0: vol_rating = "favourable"
-        elif vol_avg <= 3.5: vol_rating = "average"
-        else: vol_rating = "partially unfavourable"
+        vol_logger.info(f"Evaluating vol_avg={vol_avg:.4f} against thresholds: <=2.0 Favourable, <=3.5 Average, else Partially Unfavourable")
+        if vol_avg <= 2.0: 
+            vol_rating = "favourable"
+        elif vol_avg <= 3.5: 
+            vol_rating = "average"
+        else: 
+            vol_rating = "partially unfavourable"
+            
         modifier_scores["Volatility/Recovery in Sales"] = {"score": vol_avg, "rating": vol_rating}
         underwriting_rationale["Volatility/Recovery in Sales"] = f"Averaged risk index: {vol_avg:.2f}."
+        vol_logger.info(f"Resulting Rating: {vol_rating}")
+        vol_logger.info("========================================\n")
 
-        # Applicability of Privacy Regulation (Modifier 12)
+
+        # --- 11. Applicability of Privacy Regulation ---
+        appl_logger = get_agent_logger("Applicability of Privacy Regulation")
+        appl_logger.info("========================================")
+        appl_logger.info("Modifier Evaluation: Applicability of Privacy Regulation")
+        appl_logger.info("========================================")
         sic_codes = reconciled.get("sic_codes", ["7372"])
         sic = str(sic_codes[0]) if sic_codes else "7372"
         cust_type = str(reconciled.get("customer_type", "B2B")).upper()
         has_ecom = reconciled.get("has_ecommerce", False)
 
+        appl_logger.info(f"Input: sic_codes = {sic_codes} (using primary SIC: '{sic}')")
+        appl_logger.info(f"Input: customer_type = {cust_type}")
+        appl_logger.info(f"Input: has_ecommerce = {has_ecom}")
+
         # High privacy applicability industries: IT=737x, Healthcare=80xx, Finance=6xxx
         is_high_risk_industry = sic.startswith("737") or sic.startswith("80") or sic.startswith("6")
+        appl_logger.info(f"Checking high risk industry status (SIC prefix 737, 80, or 6): {is_high_risk_industry}")
 
+        appl_logger.info("Math Logic: Checks if industry is not high risk and customer type is B2B-only and has no ecommerce => favourable; B2B-only with ecommerce => partially favourable; else average.")
         if not is_high_risk_industry and "B2B" in cust_type and "B2C" not in cust_type and not has_ecom:
+            appl_logger.info("Industry not high risk, B2B-only, no e-commerce: rating set to 'favourable'")
             appl_rating = "favourable"
         elif not is_high_risk_industry and "B2B" in cust_type and "B2C" not in cust_type:
+            appl_logger.info("Industry not high risk, B2B-only, has e-commerce: rating set to 'partially favourable'")
             appl_rating = "partially favourable"
         else:
+            appl_logger.info("High risk industry, consumer/mixed customer type, or other configuration: rating set to 'average'")
             appl_rating = "average"
 
         modifier_scores["Applicability of Privacy Regulation"] = {"score": 0.0, "rating": appl_rating}
         underwriting_rationale["Applicability of Privacy Regulation"] = (
             f"Industry SIC {sic}, customer type {cust_type}, and ecommerce={has_ecom} evaluated for privacy regulation applicability."
         )
+        appl_logger.info(f"Resulting Rating: {appl_rating}")
+        appl_logger.info("========================================\n")
 
-        # B2C End Products
+
+        # --- 12. B2C End Products ---
+        b2c_logger = get_agent_logger("B2C End Products")
+        b2c_logger.info("========================================")
+        b2c_logger.info("Modifier Evaluation: B2C End Products")
+        b2c_logger.info("========================================")
+        b2c_logger.info(f"Input: customer_type = {cust_type}")
+        b2c_logger.info("Math Logic: B2C/B2B mix or MIX => partially favourable; pure B2C or CONSUMER or SMB => favourable; else average.")
+        
         if ("B2C" in cust_type and "B2B" in cust_type) or "MIX" in cust_type:
+            b2c_logger.info("Customer type contains mixed B2B and B2C / MIX: rating set to 'partially favourable'")
             b2c_rating = "partially favourable"
         elif "B2C" in cust_type or "CONSUMER" in cust_type or "SMB" in cust_type:
+            b2c_logger.info("Customer type is B2C / Consumer / SMB: rating set to 'favourable'")
             b2c_rating = "favourable"
         else:
+            b2c_logger.info("Customer type is pure B2B / other: rating set to 'average'")
             b2c_rating = "average"
+            
         modifier_scores["B2C End Products"] = {"score": 0.0, "rating": b2c_rating}
         underwriting_rationale["B2C End Products"] = f"Target customer category is {cust_type}."
+        b2c_logger.info(f"Resulting Rating: {b2c_rating}")
+        b2c_logger.info("========================================\n")
 
-        # Years in business (Modifier 13)
+
+        # --- 13. Years in business ---
+        yib_logger = get_agent_logger("Years in business")
+        yib_logger.info("========================================")
+        yib_logger.info("Modifier Evaluation: Years in business")
+        yib_logger.info("========================================")
         founding_year = reconciled.get("founding_year")
         current_year = datetime.now().year
         yib = None
         yib_rating = "average"
         
+        yib_logger.info(f"Input: founding_year = {founding_year}")
+        yib_logger.info(f"Input: current_year = {current_year}")
+        yib_logger.info(f"Input: revenue = {revenue}")
+        yib_logger.info("Math Logic: Years since founding year evaluated against revenue tier thresholds.")
+        
         if founding_year is not None:
             try:
                 yib = int(current_year) - int(founding_year)
-            except Exception:
+                yib_logger.info(f"Calculated Years in Business: {current_year} - {founding_year} = {yib}")
+            except Exception as e:
+                yib_logger.warning(f"Could not convert founding year '{founding_year}' to integer: {e}")
                 pass
 
         if yib is not None and yib >= 0:
             if revenue >= 1000000000:
+                yib_logger.info("Revenue Tier: >= $1B")
+                yib_logger.info(f"Evaluating yib={yib} against thresholds: >30 Very Favourable, >=20 Favourable, >=10 Partially Favourable, >=5 Average, else Unfavourable")
                 if yib > 30: yib_rating = "very favourable"
                 elif yib >= 20: yib_rating = "favourable"
                 elif yib >= 10: yib_rating = "partially favourable"
                 elif yib >= 5: yib_rating = "average"
                 else: yib_rating = "unfavourable"
             elif revenue >= 250000000:
+                yib_logger.info("Revenue Tier: >= $250M")
+                yib_logger.info(f"Evaluating yib={yib} against thresholds: >20 Very Favourable, >=10 Favourable, >=5 Partially Favourable, >=3 Average, else Unfavourable")
                 if yib > 20: yib_rating = "very favourable"
                 elif yib >= 10: yib_rating = "favourable"
                 elif yib >= 5: yib_rating = "partially favourable"
                 elif yib >= 3: yib_rating = "average"
                 else: yib_rating = "unfavourable"
             elif revenue >= 50000000:
+                yib_logger.info("Revenue Tier: >= $50M")
+                yib_logger.info(f"Evaluating yib={yib} against thresholds: >10 Very Favourable, >=7 Favourable, >=4 Partially Favourable, >=2 Average, else Unfavourable")
                 if yib > 10: yib_rating = "very favourable"
                 elif yib >= 7: yib_rating = "favourable"
                 elif yib >= 4: yib_rating = "partially favourable"
                 elif yib >= 2: yib_rating = "average"
                 else: yib_rating = "unfavourable"
             else:
+                yib_logger.info("Revenue Tier: < $50M")
+                yib_logger.info(f"Evaluating yib={yib} against thresholds: >7 Very Favourable, >=5 Favourable, >=3 Partially Favourable, >=1 Average, else Unfavourable")
                 if yib > 7: yib_rating = "very favourable"
                 elif yib >= 5: yib_rating = "favourable"
                 elif yib >= 3: yib_rating = "partially favourable"
                 elif yib >= 1: yib_rating = "average"
                 else: yib_rating = "unfavourable"
         else:
+            yib_logger.info("Founding year missing or invalid. Rating set to 'average'")
             yib_rating = "average"
 
         modifier_scores["Years in business"] = {"score": yib if yib is not None else 0.0, "rating": yib_rating}
         underwriting_rationale["Years in business"] = f"Founding year: {founding_year}. Years in business: {yib if yib is not None else 'Unknown'}."
+        yib_logger.info(f"Resulting Rating: {yib_rating}")
+        yib_logger.info("========================================\n")
 
         # Aggregate overall rating
         numeric_scores = []
@@ -803,106 +1112,7 @@ class UnderwriterAgent(BaseUnderwriterAgent):
 
         logs.append(f"Underwriter Verdict: Overall Category = {risk_category} (Confidence: {confidence_score}% - {confidence_band})")
 
-        # Logging individual modifier details to separate log files
-        from src.utils.logger import get_agent_logger
-        for name, details in modifier_scores.items():
-            mod_logger = get_agent_logger(name)
-            rating = details["rating"]
-            score = details["score"]
-            rationale = underwriting_rationale.get(name, "")
-            
-            mod_logger.info("========================================")
-            mod_logger.info(f"Modifier Evaluation: {name}")
-            mod_logger.info("========================================")
-            
-            if name == "Mergers and Acquisitions":
-                acqs = reconciled.get("acquisitions", [])
-                mod_logger.info(f"Input: acquisitions = {json.dumps(acqs)}")
-                mod_logger.info(f"Input: revenue = {revenue}")
-                mod_logger.info("Math Logic: Points calculated by deal type and recency multiplier. Thresholds depend on revenue tier.")
-                mod_logger.info(f"Calculation details: Mergers & Acquisitions points = {score:.2f} across {len(acqs)} acquisitions.")
-            elif name == "Amount of sensitive information":
-                cust_type = reconciled.get("customer_type", "B2B")
-                has_ecom = reconciled.get("has_ecommerce", False)
-                mod_logger.info(f"Input: customer_type = {cust_type}")
-                mod_logger.info(f"Input: has_ecommerce = {has_ecom}")
-                mod_logger.info("Math Logic: B2C/MIX + ecommerce => partially unfavourable; B2C/MIX + no ecommerce => average; B2B + ecommerce => partially favourable; B2B + no ecommerce => favourable.")
-            elif name == "Domain Encryption":
-                domains = reconciled.get("domains", [])
-                mod_logger.info(f"Input: domains = {json.dumps(domains)}")
-                mod_logger.info("Math Logic: Ratio of HTTPS encrypted domains. All encrypted => favourable; Some => partially favourable; None => average.")
-            elif name == "Geographic Spread":
-                countries = reconciled.get("countries_of_operation", ["USA"])
-                continents = reconciled.get("continent_spread", ["North America"])
-                usa_p = reconciled.get("usa_presence", True)
-                mod_logger.info(f"Input: countries_of_operation = {countries}")
-                mod_logger.info(f"Input: continent_spread = {continents}")
-                mod_logger.info(f"Input: usa_presence = {usa_p}")
-                mod_logger.info(f"Input: revenue = {revenue}")
-                mod_logger.info("Math Logic: Evaluates country count and continent spread against revenue tier thresholds.")
-            elif name == "Internet footprint":
-                domain_count = reconciled.get("internet_exposure_domains", 1)
-                scale = reconciled.get("customer_base_scale", "SMB (<1k)")
-                mod_logger.info(f"Input: internet_exposure_domains = {domain_count}")
-                mod_logger.info(f"Input: customer_base_scale = {scale}")
-                mod_logger.info("Math Logic: Exposure domains * scale multiplier. Enterprise => 3.0, Mid-Market => 2.0, others => 1.0.")
-                mod_logger.info(f"Calculation details: Footprint score = {score}")
-            elif name == "Nature of services":
-                appetite = reconciled.get("services_appetite", "medium_risk")
-                mod_logger.info(f"Input: services_appetite = {appetite}")
-                mod_logger.info("Math Logic: low_risk => favourable; high_risk => unfavourable; else => average.")
-            elif name == "Organizational Complexity":
-                subs = reconciled.get("subsidiaries", [])
-                mod_logger.info(f"Input: subsidiaries = {json.dumps(subs)}")
-                mod_logger.info(f"Input: revenue = {revenue}")
-                mod_logger.info("Math Logic: Subsidiary count evaluated against revenue tier thresholds.")
-                mod_logger.info(f"Calculation details: Subsidiary count = {score}")
-            elif name == "Privacy Regulation":
-                has_policy = reconciled.get("privacy_policy_published", False)
-                mentions = reconciled.get("compliance_mentions", [])
-                mod_logger.info(f"Input: privacy_policy_published = {has_policy}")
-                mod_logger.info(f"Input: compliance_mentions = {mentions}")
-                mod_logger.info("Math Logic: Policy published and compliance count >= 2 => favourable; count == 1 => partially favourable; no policy => partially unfavourable.")
-            elif name == "Seasonality of sales":
-                q_rev = reconciled.get("quarterly_revenue", [])
-                sic_codes = reconciled.get("sic_codes", ["7372"])
-                mod_logger.info(f"Input: quarterly_revenue = {q_rev}")
-                mod_logger.info(f"Input: sic_codes = {sic_codes}")
-                mod_logger.info("Math Logic: If quarterly revenue count >= 4, CV = std/mean. CV < 0.1 => favourable, CV <= 0.25 => average, else partially unfavourable. Else check if SIC starts with 5311 (high seasonality).")
-                if isinstance(score, float):
-                    mod_logger.info(f"Calculation details: Quarterly revenue Coefficient of Variation = {score:.3f}")
-                else:
-                    mod_logger.info("Calculation details: Coefficient of Variation not computed, fallback used.")
-            elif name == "Volatility/Recovery in Sales":
-                de = reconciled.get("digital_exposure", 3)
-                ds = reconciled.get("disruption_speed", 3)
-                rc = reconciled.get("recovery_complexity", 3)
-                mod_logger.info(f"Input: digital_exposure = {de}, disruption_speed = {ds}, recovery_complexity = {rc}")
-                mod_logger.info("Math Logic: Average of digital exposure, disruption speed, and recovery complexity. Average <= 2.0 => favourable, <= 3.5 => average, else partially unfavourable.")
-                mod_logger.info(f"Calculation details: Averaged Volatility/Recovery index = {score:.2f}")
-            elif name == "Applicability of Privacy Regulation":
-                sic_codes = reconciled.get("sic_codes", ["7372"])
-                cust_type = reconciled.get("customer_type", "B2B")
-                has_ecom = reconciled.get("has_ecommerce", False)
-                mod_logger.info(f"Input: sic_codes = {sic_codes}")
-                mod_logger.info(f"Input: customer_type = {cust_type}")
-                mod_logger.info(f"Input: has_ecommerce = {has_ecom}")
-                mod_logger.info("Math Logic: Checks if industry is not high risk and customer type is B2B-only and has no ecommerce => favourable; B2B-only with ecommerce => partially favourable; else average.")
-            elif name == "B2C End Products":
-                cust_type = reconciled.get("customer_type", "B2B")
-                mod_logger.info(f"Input: customer_type = {cust_type}")
-                mod_logger.info("Math Logic: B2C/B2B mix or MIX => partially favourable; pure B2C or CONSUMER or SMB => favourable; else average.")
-            elif name == "Years in business":
-                founding_year = reconciled.get("founding_year")
-                mod_logger.info(f"Input: founding_year = {founding_year}")
-                mod_logger.info(f"Input: revenue = {revenue}")
-                mod_logger.info("Math Logic: Years since founding year evaluated against revenue tier thresholds.")
-                mod_logger.info(f"Calculation details: Years in business = {score}")
-                
-            mod_logger.info(f"Resulting Score: {score}")
-            mod_logger.info(f"Resulting Rating: {rating}")
-            mod_logger.info(f"Rationale: {rationale}")
-            mod_logger.info("========================================\n")
+
 
         # Log final summarized outcomes to the Underwriter logger
         underwriter_logger.info("********************************************")

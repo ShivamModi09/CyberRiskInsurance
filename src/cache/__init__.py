@@ -73,7 +73,7 @@ class CachingCollectorWrapper:
         self.rule_id = rule_id
         self.cache_manager = cache_manager
 
-    async def collect(self, company_name: str, domain: str) -> Dict[str, Any]:
+    async def collect(self, company_name: str, domain: str, *args, **kwargs) -> Dict[str, Any]:
         from src.utils.logger import get_agent_logger
         agent_name = getattr(self.base_collector.config, 'name', self.source_type)
         logger = get_agent_logger(agent_name)
@@ -100,6 +100,6 @@ class CachingCollectorWrapper:
                     return res
                     
         logger.info(f"[{agent_name}] Cache miss. Executing live harvesting...")
-        result = await self.base_collector.collect(company_name, domain)
+        result = await self.base_collector.collect(company_name, domain, *args, **kwargs)
         logger.info(f"[{agent_name}] Extraction complete: status={result.get('status')}, findings={result.get('findings')}")
         return result

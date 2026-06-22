@@ -664,11 +664,72 @@ class DNBCollectorAgent(BaseCollectorAgent):
 
 class DomainScraperCollectorAgent(BaseCollectorAgent):
 
-    async def collect(self, company_name: str, domain: str) -> Dict[str, Any]:
+    def _check_ssl(self, domain_str: str) -> bool:
+        import ssl
+        import socket
+        try:
+            context = ssl.create_default_context()
+            with socket.create_connection((domain_str, 443), timeout=3) as sock:
+                with context.wrap_socket(sock, server_hostname=domain_str) as ssock:
+                    ssock.getpeercert()
+                    return True
+        except Exception:
+            return False
+
+    def _is_reachable(self, domain_str: str) -> bool:
+        import socket
+        try:
+            socket.gethostbyname(domain_str)
+            return True
+        except Exception:
+            return False
+
+    def _crtsh_discover(self, domain_str: str) -> set:
+        import urllib.request
+        import urllib.parse
+        import json
+        logger = self.get_logger()
+        subdomains = set()
+        try:
+            query_url = f"https://crt.sh/?q={urllib.parse.quote(domain_str)}&output=json"
+            req = urllib.request.Request(query_url, headers={'User-Agent': 'CyberRiskInsurancePOC/1.0'})
+            with urllib.request.urlopen(req, timeout=4) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                for entry in data:
+                    name_value = entry.get("name_value", "")
+                    for name in name_value.split("\n"):
+                        name = name.strip().lower()
+                        if name.startswith("*."):
+                            name = name[2:]
+                        if name:
+                            subdomains.add(name)
+        except Exception as e:
+            logger.info(f"[Domain Scraper Collector] crt.sh query failed for {domain_str}: {e}")
+        return subdomains
+
+    def _scrape_domain(self, host: str, ssl_valid: bool) -> tuple[str, bool]:
+        import urllib.request
+        import re
+        protocol = "https" if ssl_valid else "http"
+        url = f"{protocol}://{host}"
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'CyberRiskInsurancePOC/1.0'})
+            with urllib.request.urlopen(req, timeout=4) as response:
+                page_bytes = response.read()
+                page_html = page_bytes.decode('utf-8', errors='ignore')
+                cleaned = re.sub(r'<style.*?>.*?</style>', ' ', page_html, flags=re.DOTALL | re.IGNORECASE)
+                cleaned = re.sub(r'<script.*?>.*?</script>', ' ', cleaned, flags=re.DOTALL | re.IGNORECASE)
+                cleaned = re.sub(r'<[^>]+>', ' ', cleaned)
+                cleaned = re.sub(r'\s+', ' ', cleaned)
+                return cleaned, True
+        except Exception:
+            return "", False
+
+    async def collect(self, company_name: str, domain: str, discovered_domains: list = None) -> Dict[str, Any]:
         import re
         import asyncio
         logger = self.get_logger()
-        logger.info(f"[Domain Scraper Collector] Starting recursive collection for '{company_name}' on domain '{domain}'")
+        logger.info(f"[Domain Scraper Collector] Starting recursive collection for '{company_name}' on domain '{domain}' (input discovered domains: {discovered_domains})")
 
         # 1. Brand Keywords Extraction
         words = re.findall(r'[a-zA-Z0-9]+', company_name.lower())
@@ -679,39 +740,28 @@ class DomainScraperCollectorAgent(BaseCollectorAgent):
             
         logger.info(f"[Domain Scraper Collector] Brand keywords: {brand_keywords}")
 
+        # Clean and extract root hostnames from input discovered_domains
+        discovered_set = set()
+        if discovered_domains:
+            from urllib.parse import urlparse
+            for d_url in discovered_domains:
+                try:
+                    parsed = urlparse(d_url if d_url.startswith("http") else f"https://{d_url}")
+                    host = parsed.hostname or ""
+                    host = re.sub(r'^www\.', '', host.lower()).strip()
+                    if host:
+                        discovered_set.add(host)
+                except Exception:
+                    pass
+            logger.info(f"[Domain Scraper Collector] Normalized discovered domains: {list(discovered_set)}")
+
+
         # 2. Helpers for SSL, crt.sh query, and URL fetching
         async def check_ssl(domain_str: str) -> bool:
-            def blocking_ssl_check():
-                try:
-                    context = ssl.create_default_context()
-                    with socket.create_connection((domain_str, 443), timeout=3) as sock:
-                        with context.wrap_socket(sock, server_hostname=domain_str) as ssock:
-                            ssock.getpeercert()
-                            return True
-                except Exception:
-                    return False
-            return await asyncio.to_thread(blocking_ssl_check)
+            return await asyncio.to_thread(self._check_ssl, domain_str)
 
         async def discover_crtsh(domain_str: str) -> set:
-            def blocking_query():
-                subdomains = set()
-                try:
-                    query_url = f"https://crt.sh/?q={urllib.parse.quote(domain_str)}&output=json"
-                    req = urllib.request.Request(query_url, headers={'User-Agent': 'CyberRiskInsurancePOC/1.0'})
-                    with urllib.request.urlopen(req, timeout=4) as response:
-                        data = json.loads(response.read().decode('utf-8'))
-                        for entry in data:
-                            name_value = entry.get("name_value", "")
-                            for name in name_value.split("\n"):
-                                name = name.strip().lower()
-                                if name.startswith("*."):
-                                    name = name[2:]
-                                if name:
-                                    subdomains.add(name)
-                except Exception as e:
-                    logger.info(f"[Domain Scraper Collector] crt.sh query failed for {domain_str}: {e}")
-                return subdomains
-            return await asyncio.to_thread(blocking_query)
+            return await asyncio.to_thread(self._crtsh_discover, domain_str)
 
         async def scrape_url(url_str: str) -> tuple[str, set[str]]:
             def blocking_fetch():
@@ -779,6 +829,8 @@ class DomainScraperCollectorAgent(BaseCollectorAgent):
         merged_text = ""
         seen_lines = set()
         all_discovered_links = set(crtsh_subdomains)
+        if discovered_set:
+            all_discovered_links.update(discovered_set)
 
         for text, links in primary_pages_results:
             all_discovered_links.update(links)
@@ -794,8 +846,8 @@ class DomainScraperCollectorAgent(BaseCollectorAgent):
 
         # Stage 2: Filter and Limit Discovered Subdomains / Alternate Domains
         candidates = [link for link in all_discovered_links if link not in crawled_domains and is_valid_domain(link)]
-        # Cap to a maximum of 7 additional domains (making it 8 total)
-        candidates = candidates[:7]
+        # Cap to a maximum of 11 additional domains (making it 12 total)
+        candidates = candidates[:11]
 
         logger.info(f"[Domain Scraper Collector] Discovered valid domain candidates: {candidates}")
 
@@ -872,20 +924,111 @@ class DomainScraperCollectorAgent(BaseCollectorAgent):
 
 
 class ResponsesAPICollectorAgent(BaseCollectorAgent):
+
+    def _search_google(self, query: str, api_key: str) -> dict:
+        import urllib.request
+        import urllib.parse
+        import json
+        logger = self.get_logger()
+        try:
+            q = urllib.parse.quote(query)
+            url = f"https://serpapi.com/search.json?q={q}&api_key={api_key}&engine=google"
+            logger.info(f"[Responses API Collector] Requesting URL: {url.split('api_key=')[0]}api_key=...")
+            req = urllib.request.Request(url, headers={'User-Agent': 'CyberRiskInsurancePOC/1.0'})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                resp_bytes = response.read()
+                logger.info(f"[Responses API Collector] Received search response ({len(resp_bytes)} bytes)")
+                return json.loads(resp_bytes.decode('utf-8'))
+        except Exception as e:
+            logger.error(f"[Responses API Collector] SerpAPI fetch failed for '{query}': {e}")
+            return {}
+
     async def collect(self, company_name: str, domain: str) -> Dict[str, Any]:
-        # Production Responses API connector stub - skips if environment configuration is off
-        if os.environ.get("ENABLE_RESPONSES_API", "false").lower() != "true":
+        import asyncio
+        logger = self.get_logger()
+        
+        api_key = os.environ.get("SERPAPI_API_KEY")
+        # Support ENABLE_RESPONSES_API flag for tests/backwards compatibility
+        enable_flag = os.environ.get("ENABLE_RESPONSES_API", "false").lower() == "true"
+        
+        if not api_key and not enable_flag:
+            logger.warning("[Responses API Collector] SERPAPI_API_KEY is not configured in the environment. Skipping collection.")
             return {
                 "source": self.config.source_name,
                 "status": "skipped",
+                "message": "SERPAPI_API_KEY is not configured.",
                 "findings": {}
             }
-        # Otherwise placeholder returns empty findings
-        return {
-            "source": self.config.source_name,
-            "status": "success",
-            "findings": {}
-        }
+
+        # Fallback dummy API key for testing if ENABLE_RESPONSES_API is true but key is missing
+        if not api_key:
+            api_key = "test_key_dummy"
+
+        logger.info(f"[Responses API Collector] Starting SerpAPI searches for '{company_name}'")
+        queries = [
+            f"{company_name} official website domains",
+            f"{company_name} annual revenue acquisitions"
+        ]
+
+        async def run_query(q: str) -> dict:
+            return await asyncio.to_thread(self._search_google, q, api_key)
+
+        results = await asyncio.gather(*[run_query(q) for q in queries])
+
+        # Parse and format search results context
+        search_text_parts = []
+        for i, res in enumerate(results):
+            query_used = queries[i]
+            search_text_parts.append(f"=== Search Query: {query_used} ===")
+            
+            # Extract structured answers if present in SerpAPI response
+            answer_box = res.get("answer_box", {})
+            if answer_box:
+                search_text_parts.append(f"Answer Box: {json.dumps(answer_box)}")
+                
+            kg = res.get("knowledge_graph", {})
+            if kg:
+                search_text_parts.append(f"Knowledge Graph: {json.dumps(kg)}")
+                
+            organic = res.get("organic_results", [])
+            if not organic and not answer_box and not kg:
+                search_text_parts.append("No results found.")
+            for rank, item in enumerate(organic[:5], 1):
+                title = item.get("title", "")
+                link = item.get("link", "")
+                snippet = item.get("snippet", "")
+                search_text_parts.append(f"{rank}. {title}\n   Link: {link}\n   Snippet: {snippet}")
+            search_text_parts.append("")
+
+        combined_search_text = "\n".join(search_text_parts)
+        logger.info(f"[Responses API Collector] Combined search results context prepared (length: {len(combined_search_text)} characters)")
+
+        try:
+            prompt_vars = {
+                "company_name": company_name,
+                "domain": domain,
+                "search_text": combined_search_text
+            }
+            prompt = self.format_prompt(self.config.prompt_template, **prompt_vars)
+            response_text = self.call_llm(prompt)
+            extracted = self.parse_json(response_text)
+
+            findings = {k: extracted.get(k) for k in self.config.target_fields}
+            logger.info(f"[Responses API Collector] Extracted findings: {findings}")
+            return {
+                "source": self.config.source_name,
+                "status": "success",
+                "findings": findings
+            }
+        except Exception as e:
+            import traceback
+            logger.error(f"[Responses API Collector] LLM extraction failed: {e}\n{traceback.format_exc()}")
+            return {
+                "source": self.config.source_name,
+                "status": "error",
+                "message": f"LLM extraction failed: {e}\n{traceback.format_exc()}",
+                "findings": {}
+            }
 
 class WebSearchCollectorAgent(BaseCollectorAgent):
     async def collect(self, company_name: str, domain: str) -> Dict[str, Any]:
@@ -896,3 +1039,4 @@ class WebSearchCollectorAgent(BaseCollectorAgent):
             "message": "WebSearch API key not configured.",
             "findings": {}
         }
+
