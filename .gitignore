@@ -37,3 +37,4 @@ reports/
 
 # Temporary / Zip files & reports
 18_06_report.md
+.cache/

@@ -106,46 +106,82 @@ class BaseAgent:
         return template.format(**merged)
 
     def call_llm(self, prompt: str, temperature: float = 0.0) -> str:
-        azure_key = os.environ.get("AZURE_OPENAI_API_KEY")
-        azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+        # Retrieve potential Azure OpenAI environment variables
+        env_azure_key = os.environ.get("AZURE_OPENAI_API_KEY")
+        env_azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT") or os.environ.get("AZURE_OPENAI_API_BASE") or os.environ.get("OPENAI_API_BASE") or os.environ.get("OPENAI_BASE_URL")
+        env_api_version = os.environ.get("AZURE_OPENAI_API_VERSION") or os.environ.get("OPENAI_API_VERSION") or "2024-02-15-preview"
+        env_deployment_name = os.environ.get("AZURE_OPENAI_DEPLOYMENT") or os.environ.get("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME") or os.environ.get("DEPLOYMENT_NAME") or os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"
+        
         openai_key = os.environ.get("OPENAI_API_KEY")
         groq_key = os.environ.get("GROQ_API_KEY")
         
-        if not azure_key and not openai_key and not groq_key:
-            raise ValueError(
-                "No LLM credentials configured. Please set AZURE_OPENAI_API_KEY, OPENAI_API_KEY, or GROQ_API_KEY."
-            )
+        # Check signs of Azure deployment
+        is_azure = False
+        if env_azure_key:
+            is_azure = True
+        elif os.environ.get("OPENAI_API_TYPE") == "azure":
+            is_azure = True
+        elif env_azure_endpoint and ("openai.azure.com" in env_azure_endpoint or "azure" in env_azure_endpoint.lower()):
+            is_azure = True
 
         logger = self.get_logger()
         agent_name = getattr(self.config, 'name', self.__class__.__name__)
         logger.info(f"[{agent_name}] Invoking LLM for prompt/extraction...")
         logger.info(f"[{agent_name}] Prompt input sent to LLM:\n{prompt}")
 
-        if azure_key and azure_endpoint:
-            deployment_name = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
-            api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
-            model_name = deployment_name
-            llm = SimpleChatOpenAI(
-                model=deployment_name,
-                api_key=azure_key,
-                temperature=temperature,
-                azure_endpoint=azure_endpoint,
-                azure_api_version=api_version
-            )
+        if is_azure:
+            # For Azure, the effective API key could be standard OPENAI_API_KEY if AZURE_OPENAI_API_KEY is not set
+            azure_key = env_azure_key or openai_key
+            if not azure_key:
+                raise ValueError("Azure OpenAI detected but no API key configured. Set AZURE_OPENAI_API_KEY or OPENAI_API_KEY.")
+            if not env_azure_endpoint:
+                raise ValueError("Azure OpenAI detected but no endpoint configured. Set AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_API_BASE or OPENAI_API_BASE.")
+                
+            model_name = env_deployment_name
+            try:
+                from langchain_openai import AzureChatOpenAI
+                llm = AzureChatOpenAI(
+                    azure_endpoint=env_azure_endpoint,
+                    api_key=azure_key,
+                    api_version=env_api_version,
+                    azure_deployment=env_deployment_name,
+                    temperature=temperature
+                )
+            except ImportError:
+                llm = SimpleChatOpenAI(
+                    model=env_deployment_name,
+                    api_key=azure_key,
+                    temperature=temperature,
+                    azure_endpoint=env_azure_endpoint,
+                    azure_api_version=env_api_version
+                )
         elif openai_key:
             model_name = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-            llm = SimpleChatOpenAI(
-                model=model_name,
-                api_key=openai_key,
-                temperature=temperature
-            )
-        else:
+            try:
+                from langchain_openai import ChatOpenAI
+                llm = ChatOpenAI(
+                    model=model_name,
+                    api_key=openai_key,
+                    temperature=temperature
+                )
+            except ImportError:
+                llm = SimpleChatOpenAI(
+                    model=model_name,
+                    api_key=openai_key,
+                    temperature=temperature
+                )
+        elif groq_key:
             model_name = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
             llm = ChatGroq(
                 model=model_name,
                 api_key=groq_key,
                 temperature=temperature
             )
+        else:
+            raise ValueError(
+                "No LLM credentials configured. Please set AZURE_OPENAI_API_KEY, OPENAI_API_KEY, or GROQ_API_KEY."
+            )
+
         
         try:
             res = llm.invoke(prompt)
