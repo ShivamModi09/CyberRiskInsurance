@@ -114,6 +114,7 @@ class BaseAgent:
         
         openai_key = os.environ.get("OPENAI_API_KEY")
         groq_key = os.environ.get("GROQ_API_KEY")
+        azure_key = None
         
         # Check signs of Azure deployment
         is_azure = False

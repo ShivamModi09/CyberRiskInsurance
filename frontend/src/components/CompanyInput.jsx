@@ -59,7 +59,7 @@ export default function CompanyInput({ company, setCompany, domain, setDomain, o
           backgroundClip: 'text',
           WebkitBackgroundClip: 'text'
         }}>
-          Cyber Risk Intelligence
+          Cyber Risk Rater
         </div>
         
         <p style={{ fontSize: '1.15rem', color: '#64748B', margin: '0 auto 56px auto', maxWidth: '650px', lineHeight: '1.6', fontWeight: '400' }}>
@@ -178,12 +178,6 @@ export default function CompanyInput({ company, setCompany, domain, setDomain, o
             NEXT STEP <ArrowRight size={16} />
           </button>
         </div>
-
-        {apiFailed && (
-          <div style={{ marginTop: '32px', padding: '12px 24px', background: 'rgba(239, 68, 68, 0.05)', border: '1px solid rgba(239, 68, 68, 0.2)', borderRadius: '99px', color: '#FCA5A5', fontSize: '0.85rem', display: 'inline-flex', alignItems: 'center', gap: '8px' }}>
-            <Info size={16} /> System is currently running in mock fallback mode.
-          </div>
-        )}
       </div>
     </div>
   );

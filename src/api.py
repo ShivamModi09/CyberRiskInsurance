@@ -1,6 +1,8 @@
 import os
+import json
 import asyncio
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from src.registry import BusinessRuleRegistry
@@ -13,7 +15,7 @@ app = FastAPI(title="Cyber Risk Underwriter API")
 # Configure CORS for React frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:5174", "http://127.0.0.1:5173", "http://127.0.0.1:5174"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -23,58 +25,7 @@ class AnalysisRequest(BaseModel):
     company: str
     domain: str
 
-@app.post("/api/analyze")
-async def analyze_company(req: AnalysisRequest):
-    rule_id = "cyber_risk_rating"
-    company_name = req.company.strip()
-    domain = req.domain.strip()
-
-    if not company_name or not domain:
-        raise HTTPException(status_code=400, detail="Company and domain are required")
-
-    # Compile the LangGraph workflow
-    graph = build_cyber_risk_rating_graph(enable_cache=True)
-
-    # Initial State
-    initial_state = {
-        "company_name": company_name,
-        "domain": domain,
-        "rule_id": rule_id,
-        "valid": False,
-        "enrichment": {},
-        "mismatch_flag": False,
-        "entity_status": "Match",
-        "entity_resolution_confidence": "High",
-        "cache_hit": False,
-        "cache_data": None,
-        "routing_tier": "Unknown / Tiny",
-        "tool_budget": [],
-        "reports": {},
-        "collected_evidence": {},
-        "reconciled_profile": {},
-        "conflict_flags": [],
-        "claims_verification": {},
-        "accuracy_score": 0.0,
-        "risk_category": "Average",
-        "underwriting_rationale": {},
-        "modifier_scores": {},
-        "confidence_score": 0.0,
-        "confidence_band": "Low",
-        "human_escalation_flag": False,
-        "audit_logs": []
-    }
-
-    from src.utils.logger import start_run_logging
-    start_run_logging(rule_id, company_name)
-
-    try:
-        final_state = await graph.ainvoke(initial_state)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Graph execution failed: {str(e)}")
-
-    if not final_state.get("valid"):
-        raise HTTPException(status_code=400, detail="The input company name or domain is invalid.")
-
+def format_analysis_response(final_state: dict, company_name: str, domain: str) -> dict:
     # Write Cache on success (same as cli.py)
     if final_state.get("valid") and not final_state.get("cache_hit"):
         try:
@@ -189,3 +140,149 @@ async def analyze_company(req: AnalysisRequest):
         "modifiers": modifiers_formatted,
         "final_verdict": final_verdict
     }
+
+@app.post("/api/analyze")
+async def analyze_company(req: AnalysisRequest):
+    rule_id = "cyber_risk_rating"
+    company_name = req.company.strip()
+    domain = req.domain.strip()
+
+    if not company_name or not domain:
+        raise HTTPException(status_code=400, detail="Company and domain are required")
+
+    # Compile the LangGraph workflow
+    graph = build_cyber_risk_rating_graph(enable_cache=True)
+
+    # Initial State
+    initial_state = {
+        "company_name": company_name,
+        "domain": domain,
+        "rule_id": rule_id,
+        "valid": False,
+        "enrichment": {},
+        "mismatch_flag": False,
+        "entity_status": "Match",
+        "entity_resolution_confidence": "High",
+        "cache_hit": False,
+        "cache_data": None,
+        "routing_tier": "Unknown / Tiny",
+        "tool_budget": [],
+        "reports": {},
+        "collected_evidence": {},
+        "reconciled_profile": {},
+        "conflict_flags": [],
+        "claims_verification": {},
+        "accuracy_score": 0.0,
+        "risk_category": "Average",
+        "underwriting_rationale": {},
+        "modifier_scores": {},
+        "confidence_score": 0.0,
+        "confidence_band": "Low",
+        "human_escalation_flag": False,
+        "audit_logs": []
+    }
+
+    from src.utils.logger import start_run_logging
+    start_run_logging(rule_id, company_name)
+
+    try:
+        final_state = await graph.ainvoke(initial_state)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Graph execution failed: {str(e)}")
+
+    if not final_state.get("valid"):
+        raise HTTPException(status_code=400, detail="The input company name or domain is invalid.")
+
+    return format_analysis_response(final_state, company_name, domain)
+
+@app.post("/api/analyze/stream")
+async def analyze_company_stream(req: AnalysisRequest):
+    rule_id = "cyber_risk_rating"
+    company_name = req.company.strip()
+    domain = req.domain.strip()
+
+    if not company_name or not domain:
+        raise HTTPException(status_code=400, detail="Company and domain are required")
+
+    # Compile the LangGraph workflow
+    graph = build_cyber_risk_rating_graph(enable_cache=True)
+
+    # Initial State
+    initial_state = {
+        "company_name": company_name,
+        "domain": domain,
+        "rule_id": rule_id,
+        "valid": False,
+        "enrichment": {},
+        "mismatch_flag": False,
+        "entity_status": "Match",
+        "entity_resolution_confidence": "High",
+        "cache_hit": False,
+        "cache_data": None,
+        "routing_tier": "Unknown / Tiny",
+        "tool_budget": [],
+        "reports": {},
+        "collected_evidence": {},
+        "reconciled_profile": {},
+        "conflict_flags": [],
+        "claims_verification": {},
+        "accuracy_score": 0.0,
+        "risk_category": "Average",
+        "underwriting_rationale": {},
+        "modifier_scores": {},
+        "confidence_score": 0.0,
+        "confidence_band": "Low",
+        "human_escalation_flag": False,
+        "audit_logs": []
+    }
+
+    from src.utils.logger import start_run_logging
+    start_run_logging(rule_id, company_name)
+
+    async def event_generator():
+        final_state = None
+        try:
+            # Yield step 1: Initialized
+            yield f"data: {json.dumps({'type': 'step', 'step': 1, 'node': 'initial', 'status': 'done'})}\n\n"
+            
+            async for event in graph.astream_events(initial_state, version="v2"):
+                event_kind = event.get("event")
+                
+                # Check for node/chain ending
+                if event_kind == "on_chain_end":
+                    node = event.get("metadata", {}).get("langgraph_node")
+                    if node:
+                        step = None
+                        if node == "supervisor_node":
+                            step = 2
+                        elif node in ["wiki", "wikidata", "sec", "dnb", "domain", "responses"]:
+                            step = 3
+                        elif node == "coordinator":
+                            step = 4
+                        elif node == "fact_checker":
+                            step = 5
+                        elif node == "underwriter":
+                            step = 6
+                            
+                        if step is not None:
+                            yield f"data: {json.dumps({'type': 'step', 'step': step, 'node': node, 'status': 'done'})}\n\n"
+                            
+                # Capture the final result from the root LangGraph chain ending
+                if event_kind == "on_chain_end" and not event.get("metadata", {}).get("langgraph_node"):
+                    output = event.get("data", {}).get("output")
+                    if isinstance(output, dict) and "risk_category" in output and "confidence_score" in output:
+                        final_state = output
+            
+            if final_state:
+                if not final_state.get("valid"):
+                    yield f"data: {json.dumps({'type': 'error', 'message': 'The input company name or domain is invalid.'})}\n\n"
+                else:
+                    formatted = format_analysis_response(final_state, company_name, domain)
+                    yield f"data: {json.dumps({'type': 'result', 'step': 7, 'data': formatted})}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Graph execution completed without final state.'})}\n\n"
+                
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': f'Graph execution failed: {str(e)}'})}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")

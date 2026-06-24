@@ -85,17 +85,28 @@ CyberRiskInsurance/
 
 ## 💻 How to Use
 
-To evaluate a company and calculate its rating modifiers, execute the CLI entrypoint:
+### Option 1: Run via React Web App (Recommended)
+1. **Start the FastAPI Backend:**
+   ```bash
+   PYTHONPATH=. .venv/bin/python3 -m uvicorn src.api:app --reload --port 8000
+   ```
+2. **Start the Frontend Dev Server:**
+   ```bash
+   cd frontend
+   npm run dev
+   ```
+3. Open `http://localhost:5173` in your browser. Enter a target company and domain to see the live multi-agent workflow stream results in real time.
 
+### Option 2: Run via CLI Executable
+To evaluate a company directly from the console:
 ```bash
-# Run the evaluation graph
 PYTHONPATH=. .venv/bin/python3 src/cli.py --rule cyber_risk_rating --company "Liberty Mutual" --domain "www.libertymutual.com"
 ```
 
 ### CLI Command Options:
 * `--rule`: Rule configuration ID to run (e.g., `cyber_risk_rating`).
-* `--company`: Legal/trading name of the company (e.g., `"Liberty Mutual"`).
-* `--domain`: Primary domain address (e.g., `"www.libertymutual.com"`).
+* `--company`: Legal/trading name of the company.
+* `--domain`: Primary domain address.
 
 ---
 

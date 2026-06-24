@@ -21,12 +21,11 @@ import {
 function App() {
   const [company, setCompany] = useState('Microsoft');
   const [domain, setDomain] = useState('microsoft.com');
-  const [isAutoPlaying, setIsAutoPlaying] = useState(false);
+  const [isStreaming, setIsStreaming] = useState(false);
   const [hasRun, setHasRun] = useState(false);
   const [apiFailed, setApiFailed] = useState(false);
   const [analysisData, setAnalysisData] = useState(null);
   const [toasts, setToasts] = useState([]);
-  const hasShownToast = React.useRef(false);
 
   // Automated execution flow state
   const [currentStep, setCurrentStep] = useState(0);
@@ -39,66 +38,86 @@ function App() {
     }, 4000);
   };
 
-  const fetchAnalysis = async () => {
-    if (analysisData && !isAutoPlaying) return; // Don't refetch if already fetched unless forced
+  const streamAnalysis = async () => {
     try {
-      const response = await fetch('http://localhost:8000/api/analyze', {
+      const response = await fetch('http://localhost:8000/api/analyze/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ company, domain })
       });
+
       if (!response.ok) throw new Error(`API Error: ${response.status}`);
-      const data = await response.json();
-      setAnalysisData(data);
+      
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith('data:')) {
+            const dataStr = trimmed.slice(5).trim();
+            if (dataStr) {
+              try {
+                const event = JSON.parse(dataStr);
+                if (event.type === 'step') {
+                  setCurrentStep(prev => Math.max(prev, event.step));
+                } else if (event.type === 'result') {
+                  setAnalysisData(event.data);
+                  setHasRun(true);
+                  setIsStreaming(false);
+                  addToast("Analysis completed successfully", "success");
+                } else if (event.type === 'error') {
+                  console.error("Workflow error:", event.message);
+                  addToast(event.message, "error");
+                  setApiFailed(true);
+                  setIsStreaming(false);
+                }
+              } catch (e) {
+                console.error("Failed to parse event JSON:", e, dataStr);
+              }
+            }
+          }
+        }
+      }
       setApiFailed(false);
     } catch (error) {
-      console.error("Backend fetch failed. Falling back to mock data.", error);
+      console.error("Backend fetch/stream failed. Falling back to mock data.", error);
       setApiFailed(true);
-      setAnalysisData(null);
+      setIsStreaming(false);
+      setCurrentStep(7);
+      setHasRun(true);
+      addToast("Failed to connect. Using cached mock data.", "warning");
     }
   };
-
-  // Automated Presentation Mode
-  useEffect(() => {
-    let interval;
-    if (isAutoPlaying && currentStep > 0 && currentStep < 7) {
-      interval = setInterval(() => {
-        setCurrentStep(prev => {
-          if (prev >= 6) {
-            if (!hasShownToast.current) {
-              addToast("Analysis completed successfully", "success");
-              hasShownToast.current = true;
-            }
-            setHasRun(true);
-            setIsAutoPlaying(false);
-            return 7;
-          }
-          return prev + 1;
-        });
-      }, 2000); // 2 second delay between stages
-    }
-    return () => clearInterval(interval);
-  }, [isAutoPlaying, currentStep]);
 
   const handleRunFullAnalysis = async () => {
     setAnalysisData(null); // Force clear so new data loads
     setHasRun(false);
-    hasShownToast.current = false;
     setCurrentStep(1);
-    setIsAutoPlaying(true);
-    await fetchAnalysis();
+    setIsStreaming(true);
+    await streamAnalysis();
   };
 
   const handleNextStep = async () => {
     if (currentStep === 0) {
       setHasRun(false);
-      await fetchAnalysis();
+      setIsStreaming(true);
+      await streamAnalysis();
+    } else {
+      setCurrentStep(prev => {
+        const next = prev < 7 ? prev + 1 : 7;
+        if (next === 7) setHasRun(true);
+        return next;
+      });
     }
-    setCurrentStep(prev => {
-      const next = prev < 7 ? prev + 1 : 7;
-      if (next === 7) setHasRun(true);
-      return next;
-    });
   };
 
   const handlePrevStep = () => {
@@ -128,16 +147,16 @@ function App() {
     }
   };
 
-  const activeReconciled = analysisData ? analysisData.reconciled_profile : mockReconciled;
-  const activeClaims = analysisData ? analysisData.fact_checker_claims : mockClaims;
-  const activeModifiers = analysisData ? analysisData.modifiers : mockModifiers;
-  const activeVerdict = analysisData ? analysisData.final_verdict : mockVerdict;
+  const activeReconciled = analysisData?.reconciled_profile || (apiFailed ? mockReconciled : null);
+  const activeClaims = analysisData?.fact_checker_claims || (apiFailed ? mockClaims : []);
+  const activeModifiers = analysisData?.modifiers || (apiFailed ? mockModifiers : []);
+  const activeVerdict = analysisData?.final_verdict || (apiFailed ? mockVerdict : null);
 
   // Progressive disclosure
   const showWorkflow = currentStep > 0 || hasRun;
-  const showReconciled = hasRun || currentStep >= 4;
-  const showModifiers = hasRun || currentStep >= 6;
-  const showVerdict = hasRun || currentStep >= 7;
+  const showReconciled = (analysisData || apiFailed) && (hasRun || currentStep >= 4);
+  const showModifiers = (analysisData || apiFailed) && (hasRun || currentStep >= 6);
+  const showVerdict = (analysisData || apiFailed) && (hasRun || currentStep >= 7);
 
   return (
     <div className="dashboard-container">
@@ -152,7 +171,7 @@ function App() {
           onPrevStep={handlePrevStep}
           onRunFullAnalysis={handleRunFullAnalysis}
           currentStep={currentStep}
-          isAutoPlaying={isAutoPlaying}
+          isAutoPlaying={isStreaming}
           hasRun={hasRun}
           apiFailed={apiFailed}
         />
@@ -162,7 +181,7 @@ function App() {
         <div className="fade-in-slide-up" style={{ display: 'flex', flexDirection: 'column', gap: '32px', marginBottom: '32px' }}>
           <LiveAgentTelemetry 
             currentStep={currentStep} 
-            isAutoPlaying={isAutoPlaying} 
+            isAutoPlaying={isStreaming} 
             hasRun={hasRun} 
           />
         </div>
@@ -180,10 +199,10 @@ function App() {
       )}
 
       {showWorkflow && (
-        <AgentWorkflow isLoading={isAutoPlaying} hasRun={hasRun} currentStep={currentStep} />
+        <AgentWorkflow isLoading={isStreaming} hasRun={hasRun} currentStep={currentStep} />
       )}
 
-      <ExecutionTimeline isLoading={isAutoPlaying} hasRun={hasRun} currentStep={currentStep} />
+      <ExecutionTimeline isLoading={isStreaming} hasRun={hasRun} currentStep={currentStep} />
       
       <div style={{ display: 'flex', flexDirection: 'column', gap: '32px' }}>
         {showReconciled && (

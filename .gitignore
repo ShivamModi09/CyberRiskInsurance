@@ -23,6 +23,7 @@ data/changes/
 
 # Environment variables / secrets
 .env
+.env.company
 
 # Frontend dependencies and build output
 frontend/node_modules/
